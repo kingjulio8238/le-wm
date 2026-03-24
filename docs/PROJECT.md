@@ -340,82 +340,116 @@ results/
 
 ## Infrastructure Guide
 
-### What Runs Where
+### Cost Optimization Strategy
 
-| Work | Where | Why |
-|------|-------|-----|
-| Phase 0: Baseline eval | RunPod 4090 | Need CUDA for CEM planning |
-| Phase 1: Model fidelity audit | RunPod 4090 | Batched encoder/predictor inference |
-| Phase 2: Planning budget sweeps | RunPod 4090 | Many eval runs, each ~30 min |
-| Phase 3: Adaptive stopping dev | Local + RunPod | Write code locally, eval on pod |
-| Phase 4: Value function training | RunPod 4090 | Training is trivial (~minutes), but eval needs CUDA |
-| Phase 5: torch.compile / TRT | RunPod 4090 | Compilation and benchmarking need GPU |
-| Phase 6: DAgger data generation | RunPod 4090 | 50K+ planner rollouts |
-| Phase 6: Policy training | RunPod 4090 | Small but needs CUDA for eval loop |
-| Phase 7: End-to-end integration | RunPod 4090 | Final benchmarks, demos, profiling |
-| Code writing, config editing | Local (macOS) | No GPU needed |
+The #1 rule: **never leave a GPU pod idle.** Write code locally, batch GPU work into sessions, script everything to run unattended, and stop the pod the moment a session's work is done. The network volume persists data between sessions so you don't re-download or re-setup.
+
+### Pod Sessions (Batched for Minimal GPU Waste)
+
+Phases are grouped into pod sessions. Each session is one pod spin-up → do all the work → stop pod. This avoids paying for idle time between phases.
+
+| Session | Phases | What Happens | Pod Hours | Cost @ $0.40/hr |
+|---------|--------|-------------|-----------|-----------------|
+| **Session 1** | 0 + 1 | Download data (once, saved to volume). Run baseline eval + random baseline. Run fidelity audit (encoder + predictor over dataset). All scripted, runs back-to-back. | 2-3 hrs | ~$1 |
+| **Session 2** | 2 | Budget sweeps. Write a sweep script locally beforehand that loops over all (samples, iterations, solver) configs and logs results to a file. Launch it and let it run. This is the longest session because of the combinatorial grid (~25 configs x 50 episodes each). | 8-15 hrs | ~$3-6 |
+| **Session 3** | 3 + 4 | Adaptive stopping (code written locally, just eval on pod). Value function data collection + training + eval. These are both light — batch into one session. | 3-5 hrs | ~$1-2 |
+| **Session 4** | 5 | torch.compile + benchmarking. Compilation can be finicky — budget a session for iteration. INT8 calibration. nsys profiling. | 3-6 hrs | ~$1-2 |
+| **Session 5** | 6 | DAgger loop: generate 50K+ planner rollouts, train policy, deploy, collect failures, re-plan, retrain (3-5 rounds). This is compute-heavy but can be scripted to run unattended. | 6-12 hrs | ~$2-5 |
+| **Session 6** | 7 | Final integration, full eval, profiling, demo video recording. | 2-4 hrs | ~$1-2 |
+| **Total** | | | **~24-45 hrs** | **~$10-18** |
+
+### What To Do Locally (Free) Between Sessions
+
+| Between Sessions | Local Work |
+|-----------------|------------|
+| Before Session 1 | Nothing — just spin up and go |
+| Session 1 → 2 | Review fidelity results. Write the sweep script (`scripts/sweep_budget.py`) that automates all Phase 2 configs. Decide sweep grid based on Phase 1 findings. |
+| Session 2 → 3 | Analyze sweep results. Write `harness/adaptive_solver.py`. Write value function architecture (`harness/value_function.py`, `harness/value_cost.py`). All pure Python, no GPU needed. |
+| Session 3 → 4 | Review value function results. Write `harness/compiled_inference.py` scaffold. Prepare INT8 calibration script. |
+| Session 4 → 5 | Review benchmarks. Write `harness/fast_policy.py` and `harness/dual_mode.py`. Write DAgger loop script. |
+| Session 5 → 6 | Review DAgger results. Write `harness/pipeline.py` and `harness/benchmark.py`. Prepare demo recording script. |
 
 ### RunPod Setup
 
-**GPU:** RTX 4090 (24GB) — best price-performance for this workload. The model is 15M params (~30MB FP16); you're paying for throughput on batched CEM rollouts, not VRAM. An A40 or A100 would work but are overkill.
+**GPU:** RTX 4090 (24GB) — best price-performance for this workload. The model is 15M params (~30MB FP16); you're paying for throughput on batched CEM rollouts, not VRAM.
 
 **Template:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` (or latest PyTorch + CUDA 12.x). Needs `devel` variant for torch.compile/TensorRT support.
 
-**Container Disk:** 30 GB — OS + Python packages + compiled engines + checkpoints.
+**Container Disk:** 20 GB — OS + Python packages + compiled engines. Keep it small; bulk data lives on the volume.
 
-**Network Volume:** 60 GB — the PushT dataset is ~43GB uncompressed (.h5). Store datasets and checkpoints here so they persist across pod restarts. Mount at `/workspace/data` and set `export STABLEWM_HOME=/workspace/data`.
+**Network Volume:** 60 GB — the PushT dataset is ~43GB uncompressed (.h5). Store datasets, checkpoints, and results here so they persist across pod stop/start cycles. This is what saves you from re-downloading 43GB every session.
 
-**Estimated cost per phase:**
+**Volume cost:** ~$4.20/month (60GB x $0.07/GB/month). Keep it active for the duration of the project, then delete.
 
-| Phase | Pod hours (approx) | Cost @ $0.40/hr |
-|-------|--------------------|--------------------|
-| Phase 0: Baseline | 1-2 hrs | ~$1 |
-| Phase 1: Fidelity audit | 1-2 hrs | ~$1 |
-| Phase 2: Budget sweeps | 10-20 hrs (many configs) | ~$4-8 |
-| Phase 3: Adaptive stopping | 2-4 hrs | ~$1-2 |
-| Phase 4: Value function | 2-4 hrs | ~$1-2 |
-| Phase 5: Compilation + benchmark | 4-8 hrs | ~$2-3 |
-| Phase 6: DAgger (50K+ rollouts) | 8-16 hrs | ~$3-6 |
-| Phase 7: Integration + demos | 4-8 hrs | ~$2-3 |
-| **Total RunPod** | **~35-65 hrs** | **~$14-27** |
+**Total estimated project cost:**
+
+| Item | Cost |
+|------|------|
+| RunPod GPU time (~24-45 hrs @ $0.40/hr) | ~$10-18 |
+| Network volume (~1-2 months @ $4.20/mo) | ~$4-8 |
+| **Total** | **~$14-26** |
 
 ### RunPod Pod Startup Script
 
-Run this when you SSH into a new pod (or add to the pod's startup script):
+Save this to your volume at `/workspace/data/setup.sh` on first run. On subsequent sessions, just run `bash /workspace/data/setup.sh` — takes ~60 seconds instead of re-downloading everything.
 
 ```bash
-# 1. System deps
+#!/bin/bash
+set -e
+
+# 1. System deps (cached in container disk, re-run if container was rebuilt)
 apt-get update && apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev ffmpeg zstd
 
-# 2. Clone repo
+# 2. Clone/update repo
 cd /workspace
-git clone https://github.com/kingjulio8238/le-wm.git
-cd le-wm
+if [ -d "le-wm" ]; then
+  cd le-wm && git pull
+else
+  git clone https://github.com/kingjulio8238/le-wm.git && cd le-wm
+fi
 
-# 3. Install Python deps
-pip install "stable-worldmodel[train,env]" gdown
+# 3. Install Python deps (pip caches, fast on repeat runs)
+pip install -q "stable-worldmodel[train,env]" gdown
 
 # 4. Link volume for data persistence
 export STABLEWM_HOME=/workspace/data
+echo 'export STABLEWM_HOME=/workspace/data' >> ~/.bashrc
 mkdir -p $STABLEWM_HOME/pusht
 
-# 5. Download dataset + checkpoint (skip if already on volume)
+# 5. Download dataset + checkpoint (skip if already on volume — this is the key cost saver)
 if [ ! -f "$STABLEWM_HOME/pusht_expert_train.h5" ]; then
+  echo "Downloading PushT dataset (~13GB compressed → ~43GB)..."
   gdown 1WrtW2jWfZ8W5CAIfTXIw-bbvu9NMK964 -O /tmp/pusht_expert_train.h5.zst
   zstd -d /tmp/pusht_expert_train.h5.zst -o $STABLEWM_HOME/pusht_expert_train.h5
   rm /tmp/pusht_expert_train.h5.zst
+else
+  echo "Dataset already on volume, skipping download."
 fi
 
 if [ ! -f "$STABLEWM_HOME/pusht/lejepa_object.ckpt" ]; then
+  echo "Downloading checkpoint (~134MB)..."
   gdown 1CagjbwPOovHlmcvot07eWvq7fGswdYtI -O /tmp/lejepa.tar.zst
   tar --zstd -xvf /tmp/lejepa.tar.zst -C $STABLEWM_HOME/pusht/
   mv $STABLEWM_HOME/pusht/pusht/* $STABLEWM_HOME/pusht/ 2>/dev/null
   rmdir $STABLEWM_HOME/pusht/pusht 2>/dev/null
   rm /tmp/lejepa.tar.zst
+else
+  echo "Checkpoint already on volume, skipping download."
 fi
 
-echo "Ready. Run: python eval.py --config-name=pusht.yaml policy=pusht/lejepa"
+echo ""
+echo "=== Ready ==="
+echo "cd /workspace/le-wm"
+echo "python eval.py --config-name=pusht.yaml policy=pusht/lejepa"
 ```
+
+### Anti-Patterns (Things That Waste GPU Money)
+
+- **Writing code on the pod.** Write locally, push to git, pull on pod. The pod is for running, not editing.
+- **Running one eval at a time interactively.** Script the full sweep/session and let it run. Use `nohup` or `tmux` so you can disconnect.
+- **Leaving the pod running overnight.** Stop the pod when the session's work is done. The volume keeps your data.
+- **Re-downloading the 43GB dataset.** That's why the network volume exists. First session downloads; every subsequent session skips.
+- **Using A100/H100.** This is a 15M param model. A 4090 is already overkill on VRAM. You're paying for FLOPS throughput, and the 4090 has plenty.
 
 ## Future Directions (Beyond This Project)
 
