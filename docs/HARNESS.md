@@ -97,19 +97,29 @@ This runs on your GPU server to improve all three components:
 
 ## Hardware Verdict
 
-All latency estimates assume AGX Orin in MAXN power mode (60W, full 275 TOPS). Default 30W mode gives roughly half performance.
+### RTX 4090 (Primary Target)
 
-| Component | Params | Jetson AGX Orin Latency | Feasible? |
-|-----------|--------|------------------------|-----------|
-| LeWM encoder (ViT-tiny) | 5.5M | ~5-8ms (TRT FP16) | Yes |
-| LeWM predictor rollout (64 samples, 5 steps) | 9M | ~30-60ms (TRT) | Yes |
-| Value function scoring (ensemble of 5) | ~1M total | <0.5ms | Yes |
-| Fast policy (amortized) | 2-5M | <2ms | Yes |
+| Component | Params | RTX 4090 Latency | |
+|-----------|--------|------------------|-|
+| LeWM encoder (ViT-tiny) | 5.5M | <1ms (compiled FP16) | |
+| LeWM predictor rollout (64 samples, 5 steps) | 9M | ~12-37ms (compiled) | |
+| Value function scoring (ensemble of 5) | ~1M total | <0.2ms | |
+| Fast policy (amortized) | 2-5M | <1ms | |
+| **Full deliberate planning step** | | **~20-50ms** | **20-50 Hz** |
+| **Fast policy only** | | **~2-5ms** | **100+ Hz** |
+| Total GPU memory | | ~200-400MB FP16 | |
+
+### Jetson AGX Orin (Future — ~3-5x slower than 4090)
+
+| Component | Params | AGX Orin Latency (est.) | |
+|-----------|--------|-------------------------|-|
+| LeWM encoder (ViT-tiny) | 5.5M | ~5-8ms (TRT FP16) | |
+| LeWM predictor rollout (64 samples, 5 steps) | 9M | ~30-60ms (TRT) | |
+| Value function scoring (ensemble of 5) | ~1M total | <0.5ms | |
+| Fast policy (amortized) | 2-5M | <2ms | |
 | **Full deliberate planning step** | | **~50-100ms** | **10-20 Hz** |
 | **Fast policy only** | | **~7-10ms** | **50+ Hz** |
-| Total GPU memory | | ~200-400MB FP16 | 8GB Orin Nano works |
-
-Orin Nano (8GB) is viable for the optimized system. AGX Orin gives more headroom and is recommended for development.
+| Total GPU memory | | ~200-400MB FP16 | 8GB Orin Nano viable |
 
 ## Compilation Strategy
 
@@ -124,7 +134,9 @@ For the autoregressive predictor: compile the single-step forward pass. The roll
 - Dedicated CUDA streams: overlap encoder inference with CEM action sampling
 - Profile with `nsys` (Nsight Systems) for timeline analysis, `trtexec` for isolated engine benchmarks
 
-## Jetson Deployment Checklist
+## Jetson Deployment Checklist (Future — Post-Done)
+
+When Jetson hardware is available:
 
 - [ ] Set `nvpmodel` to MAXN (60W) for benchmarking; document which mode the 10 Hz target assumes
 - [ ] Build TRT engines on-device (engines are hardware-specific, do not cross-compile from desktop)
@@ -135,21 +147,22 @@ For the autoregressive predictor: compile the single-step forward pass. The roll
 
 ## Infrastructure Requirements
 
-### RunPod (Phases 0-6)
+### RunPod (All Phases)
 
 - **GPU:** RTX 4090 (24GB) — best price-performance. Model is 15M params; you need throughput, not VRAM.
 - **Template:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` (needs `devel` for torch.compile/TRT)
 - **Container Disk:** 30 GB (OS + packages + engines + checkpoints)
 - **Network Volume:** 60 GB (PushT dataset is ~43GB; persists across pod restarts)
 - **Mount volume at:** `/workspace/data`, set `export STABLEWM_HOME=/workspace/data`
-- **Estimated total cost:** ~$12-24 (30-60 pod hours @ ~$0.40/hr)
+- **Estimated total cost:** ~$14-27 (35-65 pod hours @ ~$0.40/hr)
 
-### Jetson (Phase 7)
+### Jetson (Future — Post-Done)
 
-- **Hardware:** Jetson AGX Orin Developer Kit 64GB (~$2000) — minimum Jetson for 10 Hz deliberate planning
+Jetson deployment is a future direction, not required for the current project. When ready:
+- **Hardware:** Jetson AGX Orin Developer Kit 64GB (~$2000)
 - **JetPack:** 6.2+ (CUDA 12.x, TensorRT, cuDNN)
 - **Power mode:** MAXN (60W) for benchmarking
-- **Workflow:** Develop on RunPod → export checkpoints → build TRT engines on-device → benchmark
+- **Key constraint:** TRT engines must be built on-device (not portable from x86)
 
 ## What's NOT Feasible On Jetson
 

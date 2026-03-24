@@ -6,7 +6,7 @@ LeWM is a 15M-parameter world model that predicts the future in latent space. It
 
 This project wraps LeWM in a **planning harness** that makes it plan better and plan faster, turning it from a research artifact into something that can run onboard a robot and make decisions in real time.
 
-The end state: a system where LeWM imagines candidate futures, a learned value function picks the best one, and a low-level policy executes it — all running on a Jetson at 10-50 Hz.
+The end state: a system where LeWM imagines candidate futures, a learned value function picks the best one, and a low-level policy executes it — running at 10-50 Hz on an RTX 4090, with a clear path to onboard Jetson deployment.
 
 ## Why This Matters
 
@@ -85,7 +85,7 @@ A server-side pipeline that continuously improves all three components:
 | M2: Value function | Higher success rate than MSE cost at equal budget, OR equal success at half budget |
 | M3: Real-time | <100ms per planning step on desktop GPU |
 | M4: Fast policy | >80% of planner success rate at 20+ Hz effective frequency |
-| M5: Integrated system | Dual-mode harness on Jetson at 10+ Hz within 15% of desktop success rate |
+| M5: Integrated system | Dual-mode harness on RTX 4090 at 20+ Hz with full pipeline end-to-end |
 
 ### What Failure Looks Like
 
@@ -253,53 +253,57 @@ Train a fast reactive policy and build the mode-switching harness.
 
 ---
 
-### Phase 7: End-to-End Integration
+### Phase 7: End-to-End Integration on RTX 4090
 
-Bring everything together on target hardware.
+Bring everything together into a single pipeline on the RunPod 4090 and produce the final numbers that demonstrate the system works.
 
 **Steps:**
-1. Assemble the full pipeline on Jetson AGX Orin in MAXN power mode: camera capture (V4L2 on separate thread) → GPU preprocessing (resize 224x224 + normalize) → LeWM encoder (compiled) → dual-mode harness (fast policy or planner) → action output
-2. Build all compiled engines on-device (TRT engines are hardware-specific). Warm up all engines during initialization.
-3. End-to-end latency profiling with `nsys`: measure total time from frame capture to action output. Break down by component. Test under sustained load for thermal throttling.
-4. Run the standard eval suite (PushT, and optionally TwoRoom/Cube/Reacher) through the integrated system. Compare success rates to Phase 0 baseline.
-5. Stress tests: introduce perturbations not seen during training — shifted start positions, rotated goals, novel obstacle configurations. Measure degradation.
-6. Report an efficiency comparison: params, FLOPS/decision, memory, latency, and success rate. This positions the system relative to larger approaches (VLM-backbone VLAs) on the metrics where small world models have a structural advantage — not as a head-to-head task comparison (which would be unfair in both directions).
+1. Assemble the full pipeline: observation input → image preprocessing (GPU) → LeWM encoder (compiled) → dual-mode harness (fast policy or planner with value function) → action output. All in a single `harness/pipeline.py` with clean API.
+2. End-to-end latency profiling with `nsys`: measure total time from observation to action. Break down by component (encoder, rollout, value scoring, policy forward pass, mode switching overhead).
+3. Run the standard eval suite (PushT, and optionally TwoRoom/Cube/Reacher) through the integrated pipeline. Compare success rates to Phase 0 baseline.
+4. Stress tests: introduce perturbations not seen during training — shifted start positions, rotated goals, novel obstacle configurations. Measure degradation.
+5. Produce the final efficiency comparison: params, FLOPS/decision, memory, latency, and success rate. This positions the system relative to larger approaches (VLM-backbone VLAs) on the metrics where small world models have a structural advantage.
+6. Package results: write up findings, publish comparison tables, record demo videos of the planner in action on PushT.
 
 **Artifacts:**
 - `harness/pipeline.py` — Full end-to-end inference pipeline
-- Jetson deployment scripts, power mode configs, and compiled engine files
-- Final performance table: success rate, Hz, ms/decision, memory usage, power draw
+- Final performance table: success rate, Hz, ms/decision, GPU memory usage
 - Efficiency comparison against published VLA numbers (params, FLOPS, latency)
+- Demo videos showing the world model planning and executing trajectories
+- `nsys` profiles and benchmark scripts for reproducibility
 
-**Gate:** The integrated system completes PushT episodes end-to-end on Jetson at 10+ Hz with success rate within 15% of Phase 0 desktop baseline. If latency is too high, profile and identify the bottleneck — it's likely either the encoder (consider a smaller/faster vision backbone) or the planner (reduce budget further or lean more on the fast policy). If success rate drops more than 15%, the compilation or the dual-mode switching is introducing errors — debug by running each component in isolation vs. the desktop PyTorch reference.
+**Gate:** The integrated system completes PushT episodes end-to-end on RTX 4090 at 20+ Hz effective frequency (dual-mode) with success rate within 15% of Phase 0 baseline. The full results package (numbers + demos + comparison) is ready to share publicly.
 
 ## Definition of Done: What Success Looks Like After All Phases Pass
 
 When every gate from Phase 0 through Phase 7 is green, you have a system that:
 
-### The Numbers
+### The Numbers (RTX 4090)
 
 | Metric | Baseline (Phase 0) | Target (Phase 7) |
 |--------|--------------------|--------------------|
-| Planning latency | ~1000-2500 ms/decision | <100ms deliberate, <10ms fast |
-| Control frequency | <1 Hz | 10-20 Hz deliberate, 50+ Hz fast |
+| Planning latency | ~1000-2500 ms/decision | <50ms deliberate, <5ms fast |
+| Control frequency | <1 Hz | 20-50 Hz deliberate, 100+ Hz fast |
 | Success rate | LeWM baseline on PushT | Within 15% of baseline |
-| Model size (total on-device) | 15M (world model only) | ~20-25M (WM + value fn + policy) |
-| GPU memory | N/A (desktop only) | <400MB FP16 on Jetson |
-| Power draw | N/A | <60W (AGX Orin MAXN) |
+| Total model size | 15M (world model only) | ~20-25M (WM + value fn + policy) |
+| GPU memory | Unoptimized | <400MB FP16 |
+| Forward passes/decision | 45,000 (300 x 30 x 5) | ~1,600 (64 x 5 x 5) — 28x reduction |
 
-### What You Can Do With It
+### What You Can Show The World
 
-1. **Plug in a camera and a robot arm** — the system takes raw images, imagines futures in latent space, scores them, and outputs motor commands at 10-50 Hz on a Jetson strapped to the robot. No cloud, no WiFi, no external compute.
+1. **A 15M-param world model planning at 20-50 Hz** — demonstrate that a tiny model with smart infrastructure competes on speed with systems 100-1000x larger. The demo videos show the model imagining futures in latent space, the value function scoring trajectories, and the dual-mode system switching between fast reactive control and deliberate planning.
 
-2. **Give it a goal image** — "make the scene look like this" — and it plans a sequence of actions to get there. The value function tells it whether it's making progress. The dual-mode system handles routine states reactively and thinks harder on novel situations.
+2. **Concrete efficiency comparison** — a table showing LeWM harness vs. published VLA numbers (OpenVLA, Pi0, GR-2) on params, FLOPS/decision, latency, and memory. Not a task-success comparison (unfair in both directions), but an efficiency profile that makes the case for small world models.
 
-3. **Swap environments** — the harness code (`adaptive_solver`, `value_cost`, `dual_mode`, `pipeline`) is environment-agnostic. Retrain the value function and fast policy on a new task's data; the infrastructure stays the same.
+3. **Reproducible benchmark package** — scripts, configs, checkpoints, and `nsys` profiles that anyone can run on a RunPod 4090 to verify the numbers. Open source the harness code.
 
-4. **Benchmark against larger systems** — you have a complete efficiency profile (params, FLOPS/decision, latency, memory, power) that shows the structural advantage of a 15M world model over 7-55B VLM-based VLAs on the deployment metrics that matter for onboard compute.
+4. **Give it a goal image** — "make the scene look like this" — and it plans a sequence of actions to get there. The value function tells it whether it's making progress. The dual-mode system handles routine states reactively and thinks harder on novel situations.
+
+5. **Swap environments** — the harness code (`adaptive_solver`, `value_cost`, `dual_mode`, `pipeline`) is environment-agnostic. Retrain the value function and fast policy on a new task's data; the infrastructure stays the same.
 
 ### What You Cannot Do With It (Yet)
 
+- Deploy on a physical robot (needs Jetson integration — see Future Directions)
 - Accept language instructions (no text encoder)
 - Generalize across tasks without retraining the value function and policy
 - Transfer to a real robot without sim-to-real work
@@ -319,6 +323,7 @@ harness/
   fast_policy.py         # Phase 6: DAgger-trained policy with mixture output
   dual_mode.py           # Phase 6: Mode switching with novelty, hysteresis, safety
   pipeline.py            # Phase 7: Full end-to-end inference pipeline
+  benchmark.py           # Phase 7: Reproducible benchmark script
 
 checkpoints/
   value_ensemble.pt      # Trained value function ensemble
@@ -329,7 +334,8 @@ results/
   phase1_fidelity.txt    # Prediction error vs depth
   phase2_sweeps.txt      # Planning efficiency table
   phase5_benchmarks.txt  # Latency breakdown by component
-  phase7_final.txt       # Final integrated performance
+  phase7_final.txt       # Final integrated performance + efficiency comparison
+  demo_videos/           # PushT planning demos
 ```
 
 ## Infrastructure Guide
@@ -338,15 +344,15 @@ results/
 
 | Work | Where | Why |
 |------|-------|-----|
-| Phase 0: Baseline eval | RunPod GPU | Need CUDA for CEM planning |
-| Phase 1: Model fidelity audit | RunPod GPU | Batched encoder/predictor inference |
-| Phase 2: Planning budget sweeps | RunPod GPU | Many eval runs, each ~30 min |
+| Phase 0: Baseline eval | RunPod 4090 | Need CUDA for CEM planning |
+| Phase 1: Model fidelity audit | RunPod 4090 | Batched encoder/predictor inference |
+| Phase 2: Planning budget sweeps | RunPod 4090 | Many eval runs, each ~30 min |
 | Phase 3: Adaptive stopping dev | Local + RunPod | Write code locally, eval on pod |
-| Phase 4: Value function training | RunPod GPU | Training is trivial (~minutes), but eval needs CUDA |
-| Phase 5: torch.compile / TRT | RunPod GPU | Compilation and benchmarking need GPU |
-| Phase 6: DAgger data generation | RunPod GPU | 50K+ planner rollouts |
-| Phase 6: Policy training | RunPod GPU | Small but needs CUDA for eval loop |
-| Phase 7: Jetson integration | Physical Jetson AGX Orin | Cannot be done on RunPod — engines are hardware-specific |
+| Phase 4: Value function training | RunPod 4090 | Training is trivial (~minutes), but eval needs CUDA |
+| Phase 5: torch.compile / TRT | RunPod 4090 | Compilation and benchmarking need GPU |
+| Phase 6: DAgger data generation | RunPod 4090 | 50K+ planner rollouts |
+| Phase 6: Policy training | RunPod 4090 | Small but needs CUDA for eval loop |
+| Phase 7: End-to-end integration | RunPod 4090 | Final benchmarks, demos, profiling |
 | Code writing, config editing | Local (macOS) | No GPU needed |
 
 ### RunPod Setup
@@ -370,8 +376,8 @@ results/
 | Phase 4: Value function | 2-4 hrs | ~$1-2 |
 | Phase 5: Compilation + benchmark | 4-8 hrs | ~$2-3 |
 | Phase 6: DAgger (50K+ rollouts) | 8-16 hrs | ~$3-6 |
-| Phase 7: Jetson only | 0 hrs on RunPod | $0 |
-| **Total RunPod** | **~30-60 hrs** | **~$12-24** |
+| Phase 7: Integration + demos | 4-8 hrs | ~$2-3 |
+| **Total RunPod** | **~35-65 hrs** | **~$14-27** |
 
 ### RunPod Pod Startup Script
 
@@ -411,22 +417,17 @@ fi
 echo "Ready. Run: python eval.py --config-name=pusht.yaml policy=pusht/lejepa"
 ```
 
-### Jetson Hardware
-
-**Required:** Jetson AGX Orin Developer Kit (64GB) — ~$2000. This is the minimum Jetson that can hit 10 Hz for this workload. Orin Nano is too slow for deliberate planning mode.
-
-**Setup:**
-- JetPack 6.2+ (includes CUDA 12.x, TensorRT, cuDNN)
-- Install PyTorch for Jetson from NVIDIA's pip index
-- Build TRT engines on-device (they are not portable from x86)
-- Set `nvpmodel` to MAXN (60W) for benchmarking
-
-**Workflow:** Develop and iterate on RunPod → export model checkpoints → transfer to Jetson → build engines on-device → benchmark and integrate.
-
 ## Future Directions (Beyond This Project)
 
-The following would extend this system toward a full VLA backbone but are out of scope for the current plan:
+The following extend the system beyond the RTX 4090 demonstration and are out of scope for the current plan:
 
+### Near-term: Jetson Onboard Deployment
+- **Hardware:** Jetson AGX Orin Developer Kit 64GB (~$2000) — minimum for 10 Hz deliberate planning
+- **Work:** Build TRT engines on-device (not portable from x86), thermal testing under sustained load, camera pipeline (V4L2 capture, GPU preprocessing), power mode optimization (MAXN 60W vs 30W default)
+- **Expected performance:** 10-20 Hz deliberate, 50+ Hz fast (based on known 4090-to-AGX-Orin ~3-5x scaling factor)
+- **Gate:** PushT end-to-end on Jetson at 10+ Hz within 15% of RTX 4090 success rate
+
+### Medium-term: Toward a VLA Backbone
 - **Language conditioning:** Add a text encoder (e.g., CLIP text encoder) that maps language goals to the same embedding space as image goals, enabling language-specified tasks.
 - **Multi-task generalization:** Train a single goal-conditioned value function across tasks rather than per-task, using diverse robot manipulation datasets (Open X-Embodiment, DROID).
 - **Sim-to-real transfer:** Domain randomization during world model training, real-world fine-tuning of the predictor, uncertainty-aware planning that is conservative in unfamiliar states.
