@@ -273,6 +273,156 @@ Bring everything together on target hardware.
 
 **Gate:** The integrated system completes PushT episodes end-to-end on Jetson at 10+ Hz with success rate within 15% of Phase 0 desktop baseline. If latency is too high, profile and identify the bottleneck — it's likely either the encoder (consider a smaller/faster vision backbone) or the planner (reduce budget further or lean more on the fast policy). If success rate drops more than 15%, the compilation or the dual-mode switching is introducing errors — debug by running each component in isolation vs. the desktop PyTorch reference.
 
+## Definition of Done: What Success Looks Like After All Phases Pass
+
+When every gate from Phase 0 through Phase 7 is green, you have a system that:
+
+### The Numbers
+
+| Metric | Baseline (Phase 0) | Target (Phase 7) |
+|--------|--------------------|--------------------|
+| Planning latency | ~1000-2500 ms/decision | <100ms deliberate, <10ms fast |
+| Control frequency | <1 Hz | 10-20 Hz deliberate, 50+ Hz fast |
+| Success rate | LeWM baseline on PushT | Within 15% of baseline |
+| Model size (total on-device) | 15M (world model only) | ~20-25M (WM + value fn + policy) |
+| GPU memory | N/A (desktop only) | <400MB FP16 on Jetson |
+| Power draw | N/A | <60W (AGX Orin MAXN) |
+
+### What You Can Do With It
+
+1. **Plug in a camera and a robot arm** — the system takes raw images, imagines futures in latent space, scores them, and outputs motor commands at 10-50 Hz on a Jetson strapped to the robot. No cloud, no WiFi, no external compute.
+
+2. **Give it a goal image** — "make the scene look like this" — and it plans a sequence of actions to get there. The value function tells it whether it's making progress. The dual-mode system handles routine states reactively and thinks harder on novel situations.
+
+3. **Swap environments** — the harness code (`adaptive_solver`, `value_cost`, `dual_mode`, `pipeline`) is environment-agnostic. Retrain the value function and fast policy on a new task's data; the infrastructure stays the same.
+
+4. **Benchmark against larger systems** — you have a complete efficiency profile (params, FLOPS/decision, latency, memory, power) that shows the structural advantage of a 15M world model over 7-55B VLM-based VLAs on the deployment metrics that matter for onboard compute.
+
+### What You Cannot Do With It (Yet)
+
+- Accept language instructions (no text encoder)
+- Generalize across tasks without retraining the value function and policy
+- Transfer to a real robot without sim-to-real work
+- Handle open-vocabulary goals
+- Work across different robot morphologies
+
+These are the Future Directions below — each one builds on the harness infrastructure created here.
+
+### Deliverables
+
+```
+harness/
+  adaptive_solver.py     # Phase 3: Solver wrapper with early stopping
+  value_function.py      # Phase 4: Per-step V(z_t, z_goal) ensemble
+  value_cost.py          # Phase 4: Cost model wrapper for solver integration
+  compiled_inference.py  # Phase 5: torch.compile / TRT inference wrapper
+  fast_policy.py         # Phase 6: DAgger-trained policy with mixture output
+  dual_mode.py           # Phase 6: Mode switching with novelty, hysteresis, safety
+  pipeline.py            # Phase 7: Full end-to-end inference pipeline
+
+checkpoints/
+  value_ensemble.pt      # Trained value function ensemble
+  fast_policy.pt         # DAgger-trained fast policy
+
+results/
+  phase0_baseline.txt    # Baseline numbers
+  phase1_fidelity.txt    # Prediction error vs depth
+  phase2_sweeps.txt      # Planning efficiency table
+  phase5_benchmarks.txt  # Latency breakdown by component
+  phase7_final.txt       # Final integrated performance
+```
+
+## Infrastructure Guide
+
+### What Runs Where
+
+| Work | Where | Why |
+|------|-------|-----|
+| Phase 0: Baseline eval | RunPod GPU | Need CUDA for CEM planning |
+| Phase 1: Model fidelity audit | RunPod GPU | Batched encoder/predictor inference |
+| Phase 2: Planning budget sweeps | RunPod GPU | Many eval runs, each ~30 min |
+| Phase 3: Adaptive stopping dev | Local + RunPod | Write code locally, eval on pod |
+| Phase 4: Value function training | RunPod GPU | Training is trivial (~minutes), but eval needs CUDA |
+| Phase 5: torch.compile / TRT | RunPod GPU | Compilation and benchmarking need GPU |
+| Phase 6: DAgger data generation | RunPod GPU | 50K+ planner rollouts |
+| Phase 6: Policy training | RunPod GPU | Small but needs CUDA for eval loop |
+| Phase 7: Jetson integration | Physical Jetson AGX Orin | Cannot be done on RunPod — engines are hardware-specific |
+| Code writing, config editing | Local (macOS) | No GPU needed |
+
+### RunPod Setup
+
+**GPU:** RTX 4090 (24GB) — best price-performance for this workload. The model is 15M params (~30MB FP16); you're paying for throughput on batched CEM rollouts, not VRAM. An A40 or A100 would work but are overkill.
+
+**Template:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` (or latest PyTorch + CUDA 12.x). Needs `devel` variant for torch.compile/TensorRT support.
+
+**Container Disk:** 30 GB — OS + Python packages + compiled engines + checkpoints.
+
+**Network Volume:** 60 GB — the PushT dataset is ~43GB uncompressed (.h5). Store datasets and checkpoints here so they persist across pod restarts. Mount at `/workspace/data` and set `export STABLEWM_HOME=/workspace/data`.
+
+**Estimated cost per phase:**
+
+| Phase | Pod hours (approx) | Cost @ $0.40/hr |
+|-------|--------------------|--------------------|
+| Phase 0: Baseline | 1-2 hrs | ~$1 |
+| Phase 1: Fidelity audit | 1-2 hrs | ~$1 |
+| Phase 2: Budget sweeps | 10-20 hrs (many configs) | ~$4-8 |
+| Phase 3: Adaptive stopping | 2-4 hrs | ~$1-2 |
+| Phase 4: Value function | 2-4 hrs | ~$1-2 |
+| Phase 5: Compilation + benchmark | 4-8 hrs | ~$2-3 |
+| Phase 6: DAgger (50K+ rollouts) | 8-16 hrs | ~$3-6 |
+| Phase 7: Jetson only | 0 hrs on RunPod | $0 |
+| **Total RunPod** | **~30-60 hrs** | **~$12-24** |
+
+### RunPod Pod Startup Script
+
+Run this when you SSH into a new pod (or add to the pod's startup script):
+
+```bash
+# 1. System deps
+apt-get update && apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev ffmpeg zstd
+
+# 2. Clone repo
+cd /workspace
+git clone https://github.com/kingjulio8238/le-wm.git
+cd le-wm
+
+# 3. Install Python deps
+pip install "stable-worldmodel[train,env]" gdown
+
+# 4. Link volume for data persistence
+export STABLEWM_HOME=/workspace/data
+mkdir -p $STABLEWM_HOME/pusht
+
+# 5. Download dataset + checkpoint (skip if already on volume)
+if [ ! -f "$STABLEWM_HOME/pusht_expert_train.h5" ]; then
+  gdown 1WrtW2jWfZ8W5CAIfTXIw-bbvu9NMK964 -O /tmp/pusht_expert_train.h5.zst
+  zstd -d /tmp/pusht_expert_train.h5.zst -o $STABLEWM_HOME/pusht_expert_train.h5
+  rm /tmp/pusht_expert_train.h5.zst
+fi
+
+if [ ! -f "$STABLEWM_HOME/pusht/lejepa_object.ckpt" ]; then
+  gdown 1CagjbwPOovHlmcvot07eWvq7fGswdYtI -O /tmp/lejepa.tar.zst
+  tar --zstd -xvf /tmp/lejepa.tar.zst -C $STABLEWM_HOME/pusht/
+  mv $STABLEWM_HOME/pusht/pusht/* $STABLEWM_HOME/pusht/ 2>/dev/null
+  rmdir $STABLEWM_HOME/pusht/pusht 2>/dev/null
+  rm /tmp/lejepa.tar.zst
+fi
+
+echo "Ready. Run: python eval.py --config-name=pusht.yaml policy=pusht/lejepa"
+```
+
+### Jetson Hardware
+
+**Required:** Jetson AGX Orin Developer Kit (64GB) — ~$2000. This is the minimum Jetson that can hit 10 Hz for this workload. Orin Nano is too slow for deliberate planning mode.
+
+**Setup:**
+- JetPack 6.2+ (includes CUDA 12.x, TensorRT, cuDNN)
+- Install PyTorch for Jetson from NVIDIA's pip index
+- Build TRT engines on-device (they are not portable from x86)
+- Set `nvpmodel` to MAXN (60W) for benchmarking
+
+**Workflow:** Develop and iterate on RunPod → export model checkpoints → transfer to Jetson → build engines on-device → benchmark and integrate.
+
 ## Future Directions (Beyond This Project)
 
 The following would extend this system toward a full VLA backbone but are out of scope for the current plan:

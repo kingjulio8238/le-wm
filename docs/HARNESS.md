@@ -133,6 +133,24 @@ For the autoregressive predictor: compile the single-step forward pass. The roll
 - [ ] Camera pipeline: V4L2 capture on separate thread, preprocessing (resize + normalize) on GPU
 - [ ] Track engine-to-checkpoint version mapping when models are retrained
 
+## Infrastructure Requirements
+
+### RunPod (Phases 0-6)
+
+- **GPU:** RTX 4090 (24GB) — best price-performance. Model is 15M params; you need throughput, not VRAM.
+- **Template:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04` (needs `devel` for torch.compile/TRT)
+- **Container Disk:** 30 GB (OS + packages + engines + checkpoints)
+- **Network Volume:** 60 GB (PushT dataset is ~43GB; persists across pod restarts)
+- **Mount volume at:** `/workspace/data`, set `export STABLEWM_HOME=/workspace/data`
+- **Estimated total cost:** ~$12-24 (30-60 pod hours @ ~$0.40/hr)
+
+### Jetson (Phase 7)
+
+- **Hardware:** Jetson AGX Orin Developer Kit 64GB (~$2000) — minimum Jetson for 10 Hz deliberate planning
+- **JetPack:** 6.2+ (CUDA 12.x, TensorRT, cuDNN)
+- **Power mode:** MAXN (60W) for benchmarking
+- **Workflow:** Develop on RunPod → export checkpoints → build TRT engines on-device → benchmark
+
 ## What's NOT Feasible On Jetson
 
 - Running a 4-8B VLM reward model (Robometer, LRM) — must distill offline
