@@ -607,6 +607,9 @@ The following extend the system beyond the RTX 4090 demonstration and are out of
 - **Expected performance:** 10-20 Hz deliberate, 50+ Hz fast (based on known 4090-to-AGX-Orin ~3-5x scaling factor)
 - **Gate:** PushT end-to-end on Jetson at 10+ Hz within 15% of RTX 4090 success rate
 
+### Medium-term: Co-Trained Action Head (Fast-WAM Insight)
+Fast-WAM (Yuan et al., 2026) showed that in large (6B param) world action models, the value of video/world prediction comes from **training-time dense supervision**, not test-time imagination — removing future generation at inference costs <1.5% success while giving 4x speedup. At our 15M-param scale, we still need test-time search (the model is too small to amortize dynamics into weights), but the insight suggests an experiment: co-train a small action prediction head alongside LeWM's JEPA loss from the start, rather than post-hoc DAgger distillation. If the co-trained head is strong enough, the planner becomes a fallback rather than the primary action source. This would require modifying LeWM's training pipeline.
+
 ### Medium-term: Toward a VLA Backbone
 - **Language conditioning:** Add a text encoder (e.g., CLIP text encoder) that maps language goals to the same embedding space as image goals, enabling language-specified tasks.
 - **Multi-task generalization:** Train a single goal-conditioned value function across tasks rather than per-task, using diverse robot manipulation datasets (Open X-Embodiment, DROID).
@@ -628,6 +631,7 @@ This project builds directly on:
 - **Fast-in-Slow VLA** (2025) — Dual-system VLA: System 2 (VLM) at 7-9 Hz, System 1 at 117-200 Hz. 8-11% improvement over single-system approaches.
 - **GR-2** (ByteDance, 2024) — Video-pretrained world model as VLA backbone. 97.7% success on CALVIN, 2x generalization improvement.
 - **V-JEPA 2-AC** (Meta, 2025) — JEPA world model for robotics. Plans 16x faster than pixel-space world models. Zero-shot transfer to unseen Franka arms.
+- **Fast-WAM** (Yuan et al., 2026) — Shows the value of world action models is training-time video co-supervision, not test-time imagination. At 6B params, skipping future generation at inference costs <1.5% success with 4x speedup (190ms vs 810ms). Validates our Phase 6 amortized policy approach as the small-model equivalent. At 15M params, test-time search is still needed.
 
 ## Repository Structure
 
