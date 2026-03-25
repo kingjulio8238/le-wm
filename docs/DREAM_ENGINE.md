@@ -1,0 +1,265 @@
+# LeHarness Dream Engine
+
+The next evolution of LeHarness: from flat CEM search to structured dream exploration.
+
+## What Changes
+
+LeHarness v1 (Phases 0-7) proved that a 15M-param world model can plan at 11 Hz on an RTX 4090. But it uses **flat CEM** — all dreams are the same length, same depth, independently sampled. This limits it to short-horizon tasks (horizon 5) and misses opportunities for structured exploration.
+
+The Dream Engine replaces flat search with:
+
+```
+                    ┌─ dream 1a ─── dream 1aa (score: 0.92) ← BEST
+        ┌─ dream 1 ┤
+        │          └─ dream 1b ─── dream 1ba (score: 0.71)
+root ───┤
+        │          ┌─ dream 2a ─── dream 2aa (score: 0.88)
+        ├─ dream 2 ┤
+        │          └─ dream 2b     (pruned: score < threshold)
+        │
+        └─ dream 3                 (pruned at depth 1)
+```
+
+**Dreams** = candidate trajectories in latent space (192-dim JEPA embeddings).
+**Dream trees** = branching exploration where promising dreams spawn children.
+**Dream chains** = sequences of short dreams stitched together for long-horizon tasks.
+
+## Why the 15M Model is the Right Size for This
+
+Large models (1B+) can afford ~10-100 rollouts per planning step. LeWM at 15M can afford **thousands**. On an RTX 4090, the predictor runs at ~1ms per call (compiled). That means:
+
+- 1,000 rollouts = 1 second
+- 10,000 rollouts = 10 seconds (offline planning)
+- At 11 Hz real-time: ~100 rollouts per 89ms budget
+
+This budget enables tree search that large models cannot do. The small model's speed is its moat.
+
+---
+
+## Phase D1: Multi-Task Validation
+
+**Goal:** Prove the LeHarness pipeline generalizes before adding complexity.
+
+**Why first:** If the pipeline breaks on TwoRoom or Cube, every subsequent phase inherits that fragility. Validation is cheap — the checkpoints and datasets already exist.
+
+**Steps:**
+1. Download TwoRoom, Cube, and Reacher datasets + checkpoints from the existing Google Drive.
+2. Run `harness/pipeline.py` on each task with the task's pretrained checkpoint. No code changes — just swap the config and policy path.
+3. For each task, record: success rate, planning latency, and whether the pipeline works out of the box.
+4. If a task fails, diagnose: is it the config (different action dims, horizons)? The compilation (different input shapes)? The CEM budget (different cost landscapes)?
+5. Fix any task-specific issues in the pipeline to make it truly task-agnostic.
+6. Document the per-task results and any tuning needed.
+
+**On-pod commands:**
+```bash
+# Download additional checkpoints and datasets (similar to PushT setup)
+# Then for each task:
+python scripts/final_benchmark.py --config-name=tworoom --policy tworoom/lejepa
+python scripts/final_benchmark.py --config-name=cube --policy ogb_cube/lejepa
+python scripts/final_benchmark.py --config-name=reacher --policy dmc/reacher/lejepa
+```
+
+**Gate:** Pipeline achieves >50% success on at least 3 of 4 tasks without task-specific code changes. If it needs per-task tuning (different CEM budgets), that's fine — document it. If it needs per-task code changes, the abstraction is wrong.
+
+**Estimated cost:** ~$2-4 (one pod session, 3-5 hours).
+
+---
+
+## Phase D2: Dream Chaining
+
+**Goal:** Enable long-horizon planning (horizon 20-50+) by chaining short, reliable dreams.
+
+**Why this matters:** Phase 1 showed prediction error at depth 5 is only 0.139 of inter-state distance — very reliable. But at depth 10+, error compounds. Dream chaining solves this: plan in chunks of 5-10 steps, re-anchor to reality (or to a subgoal) between chunks, and chain the chunks together.
+
+**Architecture:**
+
+```
+Dream Chain for a long-horizon task:
+
+  Observation → [Dream 1: steps 1-5] → subgoal_1
+                                         ↓
+                            re-encode → [Dream 2: steps 6-10] → subgoal_2
+                                                                  ↓
+                                                     re-encode → [Dream 3: steps 11-15] → goal
+```
+
+Each dream is a standard CEM solve over horizon 5. Between dreams, the system either:
+- **Re-encodes** the actual observation (if executing in the environment — MPC-style)
+- **Uses the predicted endpoint** as the next dream's starting state (if planning ahead without execution)
+
+**Steps:**
+1. **Implement `DreamChainer`**: A wrapper that runs CEM K times sequentially, where each CEM solve starts from the predicted endpoint of the previous one. Total horizon = K × per-dream horizon.
+2. **Subgoal generation**: For a given (start, goal) pair, linearly interpolate in latent space to generate K-1 intermediate subgoals. Each dream targets the next subgoal, not the final goal. This gives CEM a closer target and prevents it from getting stuck on distant goals.
+3. **Re-anchoring**: After executing each dream's action chunk in the environment, re-encode the actual observation to correct latent drift. This is standard MPC receding horizon — but now explicitly framed as "start a new dream from reality."
+4. **Evaluate on long-horizon tasks**: Modify PushT eval to use longer `eval_budget` (100-200 steps). Compare: single dream (horizon 5, receding) vs. chained dreams (3-5 chains of horizon 5 with subgoal interpolation).
+5. **Measure drift**: Track the MSE between predicted chain endpoints and actual re-encoded observations. This quantifies how much error accumulates across chains.
+
+**Key design decisions:**
+- **Subgoal interpolation vs. learned subgoals**: Start with linear interpolation in latent space (free, no training). If this fails (latent space isn't convex for the task), move to learned subgoal proposal (see Phase D3).
+- **Chain length**: Start with 3-5 chains (horizon 15-25). Phase 1 data suggests the model is reliable enough for this.
+- **Re-anchor frequency**: Re-encode every chain (every 5 steps). Don't try to predict 20 steps without re-anchoring.
+
+**Gate:** Dream chaining achieves higher success rate than single-horizon planning on tasks requiring >10 steps to complete. If chaining with linear subgoal interpolation fails, the latent space geometry is the bottleneck — move to learned subgoals.
+
+**Estimated cost:** ~$3-6 (one pod session, code + eval).
+
+---
+
+## Phase D3: Dream Trees
+
+**Goal:** Replace flat CEM sampling with tree-structured search over latent rollouts. Promising dreams branch into children; unpromising ones are pruned.
+
+**Why this is the core differentiator:** Every world model planner today uses flat sampling (CEM, MPPI, gradient descent). Tree search allocates more compute to promising futures and less to dead ends. At 15M params, we can afford thousands of tree nodes per planning step — something a 6B model cannot do.
+
+**Architecture: CEM-inside-MCTS**
+
+Combine CEM's sampling efficiency at the root with MCTS's structured exploration deeper in the tree. This is a novel hybrid:
+
+```
+Root node (current state):
+  ├─ CEM round 1: sample 64 action sequences, evaluate, keep top 12
+  ├─ CEM round 2: resample around elites, evaluate, keep top 12
+  ├─ CEM round 3: final refinement → top 8 "root dreams"
+  │
+  For each of the top 8 root dreams:
+    ├─ Expand: roll out to depth 5, arrive at predicted state z_5
+    ├─ At z_5: sample 8 child action sequences (from policy prior or CEM)
+    ├─ Evaluate children via rollout to depth 10
+    ├─ Keep top 2 children per parent
+    │
+    For each surviving child:
+      ├─ Expand to depth 15
+      └─ Score with terminal value estimate
+```
+
+**Budget math:** 3 CEM rounds × 64 samples = 192 root evaluations. 8 parents × 8 children = 64 depth-2 evaluations. 16 survivors × 1 final rollout = 16 depth-3 evaluations. Total: ~272 full rollouts. At ~5 predictor calls per rollout = ~1,360 forward passes. Well within the 89ms budget at compiled speed.
+
+**Steps:**
+1. **Implement `DreamTree`**: A tree data structure where each node holds (latent_state, action_sequence, cost, depth, children).
+2. **Root expansion via CEM**: At the root, run 2-3 CEM iterations to identify promising action regions. Extract the top-K elite action sequences as root children.
+3. **Progressive widening**: At each non-root node, use progressive widening (Couetoux 2011) to control branching. New children are added only when `|children| < C × visits^alpha` (alpha ~0.3-0.5). This prevents the tree from growing too wide at depth.
+4. **Child evaluation**: Each child is evaluated by rolling out the world model from the parent's predicted latent state. Score = cumulative reward along the rollout + terminal value estimate (Phase D4 value function, or MSE to goal as baseline).
+5. **Backpropagation**: After evaluating a leaf, propagate the score up the tree (max or mean of children's scores at each node). Use this to guide future expansion toward high-value branches.
+6. **Pruning**: Remove branches whose score is more than 2σ below the best sibling. This frees compute budget for promising branches.
+7. **Action selection**: After the tree is built, select the root action sequence whose subtree has the highest mean score.
+8. **Benchmark**: Compare DreamTree vs. flat CEM at matched compute budgets. The tree should outperform on tasks requiring multi-step lookahead (avoiding obstacles, sequencing contacts).
+
+**Key references:**
+- Sampled MuZero (Hubert et al., 2021) — MCTS with sampled actions for continuous spaces
+- Progressive widening (Couetoux et al., 2011) — controls branching in continuous MCTS
+- TD-MPC2 (Hansen et al., 2024) — MPPI in latent space, the current SOTA flat planner
+- TreeQN (Farquhar et al., 2018) — learned tree-structured planning in latent space
+
+**Gate:** Dream trees outperform flat CEM at equal compute budget on at least one task. Specifically: higher success rate OR same success rate with fewer total forward passes. If trees don't help, the tasks may be too simple for structured search — test on longer-horizon or more complex environments.
+
+**Estimated cost:** ~$4-8 (significant code, multiple eval sessions).
+
+---
+
+## Phase D4: Dream Scoring v2
+
+**Goal:** Fix the reward hacking problem from Phase 4 and build a robust dream scoring system that combines progress, confidence, and diversity.
+
+**Why Phase 4 failed:** The value function was trained only on expert trajectories and then exploited by CEM — the optimizer found latent states with spuriously high value that were out of the training distribution. The fix requires both better training data and architectural constraints.
+
+**Architecture: Multi-Signal Dream Scorer**
+
+```
+Dream Score = R_progress(tau)                    # task progress
+            - lambda * sigma_ensemble(tau)       # confidence penalty (MOPO-style)
+            + alpha * diversity(tau)              # diversity bonus (optional)
+```
+
+**Steps:**
+1. **Training data v2**: Collect three types of trajectories:
+   - Expert demonstrations (high progress, in-distribution)
+   - Synthetic failures: CEM with budget 8 samples / 2 iterations (low progress, shows what failure looks like)
+   - Predictor-generated rollouts: roll out the world model from real states with random actions (mixed progress, matches the distribution CEM will actually query)
+   - This triples the training data diversity and covers the regions CEM explores.
+
+2. **Conservative value training**: Train V(z_t, z_goal) with a CQL-style penalty (Kumar et al., 2020) that pushes down values for out-of-distribution inputs. Alternatively, use DreamerV3's symlog + discrete distribution head — this architecturally bounds the output range, preventing arbitrarily high values.
+
+3. **Ensemble with WARM**: Train 5 value functions independently, then weight-average their parameters (WARM, Rame et al., 2024). This retains only the generalizable features and suppresses memorized exploitable ones — one forward pass, cost of one model, robustness of five.
+
+4. **Uncertainty penalty**: During planning, subtract `lambda × max_std_across_ensemble` from the score (MOPO-style). Trajectories through uncertain regions get penalized, preventing CEM from exploiting model errors.
+
+5. **Diversity scoring (for dream trees)**: When selecting which dreams to expand in the tree, add a DPP-based diversity term (Yuan et al., 2019) that favors dreams with orthogonal latent trajectories. Compute the kernel matrix over dream embeddings and select a diverse subset.
+
+6. **Adaptive rollout truncation**: If cumulative ensemble uncertainty exceeds a threshold during a rollout, truncate and use the value estimate at the truncation point. This prevents error from compounding and being exploited (Infoprop, 2025).
+
+7. **Evaluate**: Replace MSE cost with the multi-signal scorer in both flat CEM and DreamTree. Compare success rates. The scorer should match or exceed MSE on easy tasks and significantly improve on tasks where MSE gets stuck (non-convex paths, obstacles).
+
+**Key references:**
+- MOPO (Yu et al., 2020) — uncertainty penalty on rewards
+- CQL (Kumar et al., 2020) — conservative Q-learning for OOD inputs
+- WARM (Rame et al., 2024) — weight-averaged reward models resist hacking
+- DreamerV3 (Hafner et al., 2023) — symlog + discrete distribution heads
+- DPP trajectory selection (Yuan et al., 2019) — diversity via determinantal point processes
+
+**Gate:** Multi-signal dream scorer achieves ≥ MSE success rate on PushT AND higher success rate on at least one task where MSE struggles (e.g., long-horizon or obstacle-avoidance variants). If it still underperforms MSE, the latent space is genuinely well-structured for distance-based planning and the scorer adds no value — accept this and move on.
+
+**Estimated cost:** ~$4-8 (data collection, training, evaluation).
+
+---
+
+## Phase D5: Language-Conditioned Dreams
+
+**Goal:** Let engineers specify dream goals with language instead of images.
+
+**Why last:** Language conditioning changes the goal representation but not the dream engine itself. All the tree search, chaining, and scoring infrastructure from D2-D4 works the same — only the goal embedding source changes. Building it last means it benefits from all prior improvements.
+
+**Architecture:**
+
+```
+"push the T to the target"
+         ↓
+  CLIP Text Encoder (frozen, ~150M params)
+         ↓
+  text_embedding (512-dim)
+         ↓
+  Linear projection (512 → 192)
+         ↓
+  goal_embedding (192-dim) ← same space as LeWM image goals
+         ↓
+  Dream Engine plans toward goal_embedding
+```
+
+**Steps:**
+1. **Add CLIP text encoder**: Use `openai/clip-vit-base-patch32` (frozen, ~150M params). Extract the text embedding for a task instruction. This runs once per task instruction, not per planning step — negligible latency.
+2. **Train a projection layer**: A small linear layer (512 → 192) that maps CLIP text embeddings to LeWM's goal embedding space. Train it by collecting (goal_image, goal_text) pairs from the dataset, encoding both, and minimizing MSE between `projection(CLIP_text(goal_text))` and `LeWM_encoder(goal_image)`.
+3. **Integrate with DreamEngine**: Replace `goal_embedding = encoder(goal_image)` with `goal_embedding = projection(CLIP_text(goal_text))` when a text instruction is provided. The rest of the pipeline (CEM, trees, chains, scoring) is unchanged.
+4. **Evaluate**: Test with held-out text instructions. Compare success rates when the goal is specified via image vs. text. The text path will likely be slightly worse (lossy projection) but should be within 10%.
+5. **Failure mode**: If the CLIP-to-LeWM projection is too lossy (text goal embeddings are far from image goal embeddings), consider fine-tuning the projection with contrastive loss or using a larger CLIP model.
+
+**What this enables:** An engineer can now do:
+```python
+pipeline = DreamEngine("pusht/lejepa")
+action = pipeline.plan(obs_image, goal_text="push the T to the target")
+```
+
+**Gate:** Language-conditioned planning achieves ≥80% of image-conditioned success rate on PushT.
+
+**Estimated cost:** ~$2-4 (CLIP is off-the-shelf, projection training is minutes).
+
+---
+
+## Summary: Dream Engine Phases
+
+```
+D1: Multi-Task Validation   ← prove generality, cheapest phase
+D2: Dream Chaining           ← long-horizon via chained short dreams
+D3: Dream Trees              ← structured search, core differentiator
+D4: Dream Scoring v2         ← robust multi-signal scoring, fix reward hacking
+D5: Language Conditioning     ← text goals, table stakes for adoption
+```
+
+**Total estimated cost:** ~$15-30 across all phases on RunPod RTX 4090.
+
+**What the Dream Engine enables that flat CEM cannot:**
+- Long-horizon tasks (20-50+ steps) via dream chaining
+- Structured exploration via dream trees (allocate compute to promising futures)
+- Robust scoring that resists reward hacking
+- Language-specified goals
+- All of this on a 15M-param model at interactive speeds
+
+**The thesis:** Small world models + smart dream infrastructure > large models + flat search.
