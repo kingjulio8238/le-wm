@@ -158,7 +158,7 @@ def run_eval(solver: str, num_samples: int, n_steps: int, policy: str,
             print(f"  Planning latency: ~{result['ms_per_step']:.0f} ms/step")
         else:
             print(f"  WARNING: Could not parse success_rate from output")
-            result["error"] = result.get("error", "") + " | no success_rate parsed"
+            result["error"] = (result.get("error") or "") + " | no success_rate parsed"
 
     except subprocess.TimeoutExpired:
         elapsed = time.time() - start
