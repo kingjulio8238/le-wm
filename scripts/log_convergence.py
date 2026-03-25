@@ -139,8 +139,8 @@ def run_instrumented_eval(solver_name, num_samples, n_steps, policy, num_eval=5,
         solver=solver, config=config, process=process, transform=transform
     )
 
-    # Create world
-    cfg_world = dict(cfg.world)
+    # Create world — resolve manually since max_episode_steps is ??? in config
+    cfg_world = OmegaConf.to_container(cfg.world, resolve=True, throw_on_missing=False)
     cfg_world["max_episode_steps"] = 2 * cfg.eval.eval_budget
     world = swm.World(**cfg_world, image_shape=(224, 224))
 
