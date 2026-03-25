@@ -224,34 +224,50 @@ Replace MSE embedding distance with a learned per-step value function that captu
 - Trained value function ensemble checkpoint
 - Comparison table: success rate at {32, 64, 128} samples with MSE cost vs. learned value function
 
-**Gate:** Learned value function achieves higher success rate than MSE cost at the same planning budget on at least one task, OR achieves equal success rate at half the planning budget. Evaluate per-task — passing on PushT and Cube but tying on Reacher still counts. If neither holds on any task, the latent space is already well-structured for MSE-based planning — skip this layer and proceed directly to speed optimization.
+**Gate: SKIP.** Latent space is already well-structured for MSE-based planning (94% at CEM 128×15). Value function achieved 62-70% — reward hacking by CEM against the learned cost. Per project plan: "skip this layer and proceed directly to speed optimization."
+
+**Artifacts (for future reference):**
+- `harness/value_function.py` — Value function architecture + training
+- `harness/value_cost.py` — Cost model wrapper for solver integration
+- `scripts/collect_value_data.py`, `scripts/train_value_function.py`, `scripts/eval_value_function.py`
+- `/workspace/data/results/phase4_value_function.json`
 
 ---
 
-### Phase 5: Compilation and Speed Optimization
+### Phase 5: Compilation and Speed Optimization ✅ COMPLETE
 
 Make the existing pipeline fast enough for real-time by compiling the neural network components.
 
-**Steps:**
-1. Apply `torch.compile(backend="tensorrt")` to the ViT-tiny encoder with fixed input shape (1, 3, 224, 224). Verify output matches eager PyTorch within tolerance. If torch.compile fails, fall back to explicit ONNX → TensorRT FP16 export.
-2. Apply `torch.compile` to the single-step predictor forward pass with fixed batch size (64) and sequence length (3). The autoregressive rollout loop stays in Python. If torch.compile fails for the AdaLN-conditioned blocks, fall back to `torch.jit.script` or ONNX export.
-3. Compile the value function ensemble (if Phase 4 passed).
-4. Replace `torch.cat` in the rollout loop (`jepa.py:94,97`) with writes into pre-allocated buffers.
-5. Collect ~500 representative (emb, act_emb) pairs from actual planning runs. Run INT8 post-training quantization calibration. Validate that INT8 cost divergence from FP16 is <1%.
-6. Benchmark on target hardware:
-   - Desktop GPU: measure ms/decision breakdown by component (use `torch.cuda.Event` timing)
-   - Profile with `nsys` (Nsight Systems) to identify kernel launch gaps, memory transfer stalls, Python overhead
-   - If kernel launch overhead dominates the predictor calls, capture a CUDA Graph for the single-step predictor forward pass
-   - Jetson AGX Orin (if available): build engines on-device (they are hardware-specific), benchmark in MAXN power mode (60W)
+**Approach:** `torch.compile(backend='inductor', mode='reduce-overhead')` on the ARPredictor. The `reduce-overhead` mode enables CUDA graphs, eliminating kernel launch overhead which dominated the 90 sequential predictor calls per planning step.
+
+**Results (RTX 4090, CEM 128×15, cached encoder):**
+
+| Component | Eager | Compiled | Speedup |
+|-----------|-------|----------|---------|
+| Predictor per-call | 3.79 ms | 1.04 ms | 3.6x |
+| Full planning step (15 iters) | 547 ms | 82 ms | 6.7x |
+
+**Latency at different budgets (compiled + cached encoding):**
+
+| Config | Compiled Latency | SR% |
+|--------|-----------------|-----|
+| CEM 128×15 | **82 ms** | 92% |
+| CEM 128×10 | **54 ms** | 86% |
+| CEM 128×7 | **38 ms** | 68% |
+
+**Gate: PASS.** CEM 128×15 at 82ms on RTX 4090, maintaining 92% success rate. This is a **16x reduction** from the Phase 0 baseline of 1,310ms.
+
+**Key optimizations:**
+1. `torch.compile(mode='reduce-overhead')` on predictor — CUDA graphs eliminate kernel launch overhead (3.6x per-call speedup)
+2. Cached encoder/goal encoding — encode observation and goal once per planning step, not per CEM iteration (saves ~150ms)
+3. Pre-allocated rollout buffers — replaces `torch.cat` with in-place writes
+4. TF32 matmul precision — `torch.set_float32_matmul_precision('high')`
+
+**What was NOT needed:** TensorRT, ONNX export, INT8 quantization, nsys profiling. The inductor backend with CUDA graphs was sufficient.
 
 **Artifacts:**
-- Compiled encoder, predictor, and value function modules
-- INT8 calibration dataset and quantized engines (if applicable)
-- `harness/compiled_inference.py` — Compiled inference wrapper
-- Benchmark table: ms/decision breakdown by component on each hardware target
-- `nsys` timeline profiles identifying remaining bottlenecks
-
-**Gate:** Full deliberate planning step (encode + rollout + score + select) completes in <100ms on desktop GPU. On AGX Orin (if tested), <200ms at FP16 or <150ms at INT8. The gate is about latency, not the specific compilation method — torch.compile, TensorRT, torch.jit.script, or even eager PyTorch with INT8 are all acceptable if they hit the target. If no method hits the target, reduce the planning budget further (Phase 2 data shows the tradeoff) or accept a lower control frequency for deliberate mode.
+- `harness/compiled_inference.py` — Compiled inference wrapper with buffer optimization
+- `scripts/benchmark_latency.py` — Component-level latency profiling
 
 ---
 
