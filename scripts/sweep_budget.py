@@ -40,7 +40,7 @@ for iters in [15, 10, 5, 3]:
     SWEEP_CONFIGS.append(("cem", 300, iters))
 
 # Step 3: Joint sweep at promising intersections (CEM)
-for samples, iters in [(128, 10), (128, 5), (64, 10), (64, 5), (64, 3), (32, 10), (32, 5), (16, 10), (16, 5)]:
+for samples, iters in [(128, 15), (128, 10), (128, 5), (64, 15), (64, 10), (64, 5), (64, 3), (32, 15), (32, 10), (32, 5), (16, 10), (16, 5)]:
     SWEEP_CONFIGS.append(("cem", samples, iters))
 
 # Step 4: iCEM at the same grid (this is where we expect the wins)
@@ -50,7 +50,7 @@ for samples in [300, 128, 64, 32, 16]:
 for iters in [15, 10, 5, 3]:
     SWEEP_CONFIGS.append(("icem", 300, iters))
 
-for samples, iters in [(128, 10), (128, 5), (64, 10), (64, 5), (64, 3), (32, 10), (32, 5), (16, 10), (16, 5)]:
+for samples, iters in [(128, 15), (128, 10), (128, 5), (64, 15), (64, 10), (64, 5), (64, 3), (32, 15), (32, 10), (32, 5), (16, 10), (16, 5)]:
     SWEEP_CONFIGS.append(("icem", samples, iters))
 
 # Deduplicate while preserving order
@@ -90,12 +90,12 @@ def run_eval(solver: str, num_samples: int, n_steps: int, policy: str,
     # Build the command
     cmd = [
         sys.executable, "eval.py",
-        f"--config-name=pusht.yaml",
+        f"--config-name=pusht",
         f"policy={policy}",
         f"solver={solver}",
         f"solver.num_samples={num_samples}",
         f"solver.n_steps={n_steps}",
-        f"solver.topk={min(num_samples, 30)}",  # topk can't exceed num_samples
+        f"solver.topk={max(1, min(num_samples // 5, 30))}",  # ~20% of samples, capped at 30
         f"eval.num_eval={num_eval}",
         f"seed={seed}",
     ]
@@ -281,7 +281,7 @@ def main():
         successful.sort(key=lambda r: r["forward_passes"])
 
         baseline_sr = 98.0
-        threshold_sr = baseline_sr * 0.95  # within 5%
+        threshold_sr = baseline_sr - 5.0  # within 5 percentage points
 
         print(f"{'Solver':>6s} {'Samples':>7s} {'Iters':>5s} {'FwdPass':>8s} "
               f"{'SR%':>6s} {'ms/step':>7s} {'Gate':>6s}")
