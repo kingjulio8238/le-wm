@@ -243,6 +243,94 @@ action = pipeline.plan(obs_image, goal_text="push the T to the target")
 
 ---
 
+## On-Pod vs Off-Pod Work
+
+### The Rule
+
+**Off-pod (local, free):** Write code, design architectures, review results, plan experiments. No GPU needed.
+
+**On-pod (RunPod 4090, ~$0.40/hr):** Run evals, collect data, train models, benchmark. GPU time is for execution, not thinking.
+
+### Per-Phase Breakdown
+
+#### D1: Multi-Task Validation
+
+| Off-Pod | On-Pod |
+|---------|--------|
+| Nothing — this phase is all execution | Download TwoRoom/Cube/Reacher data + checkpoints to volume |
+| | Run `final_benchmark.py` on each task |
+| | Record results, diagnose any failures |
+| Review results, document per-task findings | |
+
+#### D2: Dream Chaining
+
+| Off-Pod | On-Pod |
+|---------|--------|
+| Design `DreamChainer` class (wrapper around CEM solver) | Run chained vs. single-horizon eval on PushT |
+| Implement subgoal interpolation logic (pure Python, no GPU) | Test with extended eval_budget (100-200 steps) |
+| Write eval script for long-horizon comparison | Measure drift between predicted and actual re-encoded states |
+| Push code to git | |
+
+#### D3: Dream Trees
+
+| Off-Pod | On-Pod |
+|---------|--------|
+| Design `DreamTree` data structure (nodes, edges, scores) | Benchmark DreamTree vs flat CEM at matched compute |
+| Implement CEM-inside-MCTS logic: root expansion, progressive widening, backprop, pruning | Profile per-node latency to verify budget math |
+| Implement action selection from completed tree | Test on multiple tasks from D1 |
+| Write tree visualization / logging for debugging | |
+| This is the most code-heavy phase — most work is off-pod | |
+
+#### D4: Dream Scoring v2
+
+| Off-Pod | On-Pod |
+|---------|--------|
+| Design multi-signal scorer architecture | Collect training data v2 (expert + failures + predictor rollouts) |
+| Implement CQL penalty, WARM weight averaging, symlog heads | Train value ensemble (~minutes) |
+| Implement DPP diversity selection | Evaluate scorer in flat CEM and DreamTree |
+| Implement adaptive rollout truncation | Compare vs MSE baseline on all tasks |
+| Write training script with all three data sources | |
+
+#### D5: Language Conditioning
+
+| Off-Pod | On-Pod |
+|---------|--------|
+| Design CLIP → LeWM projection architecture | Collect (goal_image, goal_text) pairs from dataset |
+| Implement text goal encoding path in pipeline | Train projection layer (~minutes) |
+| Write eval script for text vs image goal comparison | Evaluate text-conditioned planning |
+| | Compare success rates: text vs image goals |
+
+### Pod Sessions (Batched)
+
+Phases should be grouped into pod sessions to minimize idle GPU time. Write all code locally between sessions.
+
+| Session | Phases | What to write locally first | Pod work |
+|---------|--------|-----------------------------|----------|
+| **D-Session 1** | D1 | Nothing | Download data, run benchmarks on 4 tasks |
+| **D-Session 2** | D2 | `DreamChainer`, subgoal interpolation, eval script | Run chained eval, measure drift |
+| **D-Session 3** | D3 | `DreamTree` (all logic), tree logging, benchmark script | Profile and benchmark trees vs flat CEM |
+| **D-Session 4** | D4 | Scorer architecture, training script, all penalty implementations | Collect data, train, evaluate |
+| **D-Session 5** | D5 | CLIP integration, projection layer, text eval script | Train projection, evaluate |
+
+**Between sessions:** Review results from the previous session. Decide whether the gate passed. Write all code for the next session. Push to git. Only spin up the pod when code is ready to run.
+
+**Anti-patterns (same as v1):**
+- Writing code on the pod — write locally, push to git, pull on pod
+- Running one eval interactively — script everything, use tmux
+- Leaving pod idle — stop when the session's work is done
+- Re-downloading data — it's on the network volume from v1
+
+### Pod Startup (Every Session)
+
+```bash
+bash /workspace/data/setup.sh
+cd /workspace/le-harness
+# For D1, also download additional task data:
+# gdown <tworoom_id> -O /tmp/tworoom.h5.zst && zstd -d ... etc.
+```
+
+---
+
 ## Summary: Dream Engine Phases
 
 ```
@@ -253,7 +341,7 @@ D4: Dream Scoring v2         ← robust multi-signal scoring, fix reward hacking
 D5: Language Conditioning     ← text goals, table stakes for adoption
 ```
 
-**Total estimated cost:** ~$15-30 across all phases on RunPod RTX 4090.
+**Total estimated cost:** ~$15-30 across 5 pod sessions on RunPod RTX 4090.
 
 **What the Dream Engine enables that flat CEM cannot:**
 - Long-horizon tasks (20-50+ steps) via dream chaining
