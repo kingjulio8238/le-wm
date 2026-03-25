@@ -123,5 +123,99 @@ Both functions accept:
 
 The returned module is in `eval` mode with its PyTorch weights accessible via `.state_dict()`.
 
+---
+
+## LeHarness: Optimized Planning Infrastructure
+
+LeHarness wraps LeWM in an optimized planning infrastructure that reduces planning latency from **1,310ms to 89ms** (15x speedup) while maintaining 94% success rate on PushT.
+
+### What LeHarness Does
+
+LeHarness makes LeWM plan **faster** without changing the model. It optimizes the CEM planning loop that searches for good actions:
+
+1. **Budget reduction** — Finds the minimum CEM samples × iterations that maintains accuracy (4.7x fewer forward passes)
+2. **Compiled inference** — `torch.compile` with CUDA graphs on the predictor transformer (3.6x per-call speedup)
+3. **Cached encoding** — Encodes observation and goal images once per planning step, not per CEM iteration
+4. **Pre-allocated buffers** — Eliminates tensor allocation in the autoregressive rollout loop
+
+### Quick Start (on RunPod RTX 4090)
+
+```bash
+# Setup
+pip install "stable-worldmodel[train,env]"
+export STABLEWM_HOME=/workspace/data
+
+# Use the pipeline
+python -c "
+from harness.pipeline import PlanningPipeline
+import numpy as np
+
+pipeline = PlanningPipeline('pusht/lejepa', num_samples=128, n_steps=15)
+pipeline.warmup()  # one-time compilation (~30s)
+
+# Plan from images
+obs = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+goal = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
+action = pipeline.plan(obs, goal)
+
+print(f'Action: {action}')
+print(f'Timing: {pipeline.get_timing_summary()}')
+"
+```
+
+### Reproducing Results
+
+```bash
+# Run the final benchmark
+python scripts/final_benchmark.py --policy pusht/lejepa
+
+# Run the standard eval (50 episodes)
+python eval.py --config-name=pusht policy=pusht/lejepa solver=cem \
+    solver.num_samples=128 solver.n_steps=15 solver.topk=25 eval.num_eval=50
+
+# Run the budget sweep (finds optimal CEM config)
+python scripts/sweep_budget.py --policy pusht/lejepa --dry-run
+```
+
+### Results
+
+| Metric | Baseline | LeHarness | Improvement |
+|--------|----------|-----------|-------------|
+| Planning latency | 1,310 ms | **89 ms** | **15x** |
+| Control frequency | 0.76 Hz | **11.2 Hz** | **15x** |
+| Success rate | 98% | **94%** | -4pp |
+| Forward passes/step | 45,000 | **9,600** | 4.7x |
+| Peak GPU memory | — | **89 MB** | — |
+| Model size | 15M | **15M** | unchanged |
+
+### Repository Structure
+
+```
+le-harness/
+  jepa.py                          # LeWM model (encoder, predictor, rollout, cost)
+  module.py                        # Transformer blocks, attention, embedders
+  eval.py                          # Standard evaluation with CEM planning
+  harness/
+    pipeline.py                    # End-to-end planning API (Phase 7)
+    compiled_inference.py          # torch.compile + CUDA graphs + buffers (Phase 5)
+    adaptive_solver.py             # Early stopping wrapper (Phase 3)
+    value_function.py              # Learned value function (Phase 4)
+    value_cost.py                  # Value cost model for solver (Phase 4)
+  scripts/
+    final_benchmark.py             # Reproducible end-to-end benchmark
+    sweep_budget.py                # Staged CEM budget sweep
+    benchmark_latency.py           # Component-level latency profiling
+    log_convergence.py             # Per-iteration cost convergence
+    eval_adaptive.py               # Adaptive stopping evaluation
+    patch_icem.py                  # Fix for iCEM action bounds
+  config/                          # Hydra configs for training and eval
+  docs/
+    PROJECT.md                     # Full project documentation with all results
+    VOLUME.md                      # Network volume layout
+    HARNESS.md                     # Technical architecture details
+```
+
+See [docs/PROJECT.md](docs/PROJECT.md) for the full project documentation including all phase results, design decisions, and future directions.
+
 ## Contact & Contributions
 Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`
