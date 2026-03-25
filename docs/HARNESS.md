@@ -1,6 +1,6 @@
-# LeWM Planning Harness
+# LeHarness
 
-Plan for building an optimized planning harness around LeWM for onboard robotic deployment.
+Technical architecture for the LeHarness planning system around LeWM, targeting real-time robotic deployment.
 
 ## The System
 

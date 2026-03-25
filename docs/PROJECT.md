@@ -1,10 +1,10 @@
-# LeWM Planning Harness: Project Overview
+# LeHarness: Project Overview
 
 ## What Is This
 
-LeWM is a 15M-parameter world model that predicts the future in latent space. It's small, fast to train, and its representations encode real physical structure. But out of the box, it plans slowly (1-2 seconds per decision) and scores trajectories with raw embedding distance — a blunt instrument.
+**LeHarness** is a planning harness around [LeWM](https://github.com/lucas-maes/le-wm), a 15M-parameter JEPA world model that predicts the future in latent space. LeWM is small, fast to train, and its representations encode real physical structure. But out of the box, it plans slowly (1-2 seconds per decision) and scores trajectories with raw embedding distance — a blunt instrument.
 
-This project wraps LeWM in a **planning harness** that makes it plan better and plan faster, turning it from a research artifact into something that can run onboard a robot and make decisions in real time.
+LeHarness wraps LeWM in an optimized planning infrastructure that makes it plan better and plan faster, turning it from a research artifact into something that can run onboard a robot and make decisions in real time.
 
 The end state: a system where LeWM imagines candidate futures, a learned value function picks the best one, and a low-level policy executes it — running at 10-50 Hz on an RTX 4090, with a clear path to onboard Jetson deployment.
 
@@ -18,9 +18,9 @@ The robotics field is converging on two approaches to robot intelligence:
 
 This project demonstrates the latency and efficiency advantages of small world models for real-time robotic planning. A 15M-param model that plans at 10-50 Hz on a Jetson is a fundamentally different deployment profile than a 7-55B VLM requiring cloud GPUs. This is a stepping stone toward using world models as the planning backbone in a dual-system VLA architecture — the System 1 (fast reactive control) and System 2 (deliberate planning) that systems like GR00T N1 and Fast-in-Slow VLA are converging on.
 
-**What this project is:** An efficient, real-time, image-goal-conditioned planner with a learned value function and dual-mode execution.
+**What LeHarness is:** An efficient, real-time, image-goal-conditioned planner with a learned value function and dual-mode execution.
 
-**What this project is not (yet):** A full VLA backbone. That would additionally require language conditioning, multi-task generalization, and cross-embodiment support — all valid future directions that build on the infrastructure created here.
+**What LeHarness is not (yet):** A full VLA backbone. That would additionally require language conditioning, multi-task generalization, and cross-embodiment support — all valid future directions that build on the infrastructure created here.
 
 ## What We're Building
 
@@ -424,7 +424,7 @@ cd /workspace
 if [ -d "le-wm" ]; then
   cd le-wm && git pull
 else
-  git clone https://github.com/kingjulio8238/le-wm.git && cd le-wm
+  git clone https://github.com/kingjulio8238/le-harness.git && cd le-wm
 fi
 
 # Python deps
@@ -551,7 +551,7 @@ cd /workspace
 if [ -d "le-wm" ]; then
   cd le-wm && git pull
 else
-  git clone https://github.com/kingjulio8238/le-wm.git && cd le-wm
+  git clone https://github.com/kingjulio8238/le-harness.git && cd le-wm
 fi
 
 # 3. Install Python deps (pip caches, fast on repeat runs)
@@ -636,7 +636,7 @@ This project builds directly on:
 ## Repository Structure
 
 ```
-le-wm/
+le-harness/
   jepa.py          # LeWM world model (encoder, predictor, rollout, cost)
   module.py        # Transformer blocks, attention, embedders, SIGReg
   train.py         # Training loop
@@ -646,5 +646,6 @@ le-wm/
   docs/
     PROJECT.md     # This document
     HARNESS.md     # Technical architecture details
-  harness/         # Planning harness code (built during phases)
+  harness/         # LeHarness code (built during phases)
+  scripts/         # Sweep, benchmark, and utility scripts
 ```
