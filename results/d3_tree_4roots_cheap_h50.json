@@ -1,0 +1,35 @@
+{
+  "tree": {
+    "success_rate": 18.0,
+    "num_successes": 9,
+    "mean_planning_ms": 351.1226815212032,
+    "effective_hz": 2.8480074134419398,
+    "tree_timing": {
+      "total_ms": {
+        "mean": 351.08691847923654,
+        "std": 3.4973683575196644,
+        "p50": 350.5709422752261
+      },
+      "root_ms": {
+        "mean": 169.56568514604282,
+        "std": 0.8089595034168354,
+        "p50": 169.4555263966322
+      },
+      "expansion_ms": {
+        "mean": 169.20065615812072,
+        "std": 0.81511916515663,
+        "p50": 169.04934216290712
+      },
+      "effective_hz": 2.848297522253426,
+      "total_cem_calls": 4.0,
+      "total_nodes": 5.0
+    },
+    "config": {
+      "num_roots": 2,
+      "max_depth": 2
+    }
+  },
+  "eval_budget": 50,
+  "num_eval": 50,
+  "seed": 42
+}

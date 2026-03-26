@@ -1,22 +1,17 @@
 """
 D3: Dream Trees — tree-structured lookahead using compiled CEM.
 
-Uses the pipeline's existing compiled _cem_plan as the atomic operation.
-Tree structure provides lookahead by expanding promising root actions
-into deeper plans, then backpropagating scores to select the best
-root action.
+Uses the pipeline's compiled _cem_plan for root action generation and
+cheap single-pass scoring for depth evaluation. Tree structure provides
+lookahead by scoring how plannable each root candidate's future state is.
 
 Architecture:
-  Root: pipeline._cem_plan → best action + terminal embedding
-  Depth 2: run _cem_plan from terminal embedding → child cost
-  Repeat for K diverse root candidates (from CEM's final elite set)
-  Select root action whose subtree has the lowest cost
+  Root: K calls to _cem_plan → K diverse (action, terminal_emb) pairs
+  Depth scoring: _score_state on each terminal_emb (single pass, no CEM)
+  Select: root action whose terminal state has the lowest score
 
-The key insight: flat CEM picks the root action with the lowest
-immediate cost. Dream Tree picks the root action whose *future*
-(after re-planning from the predicted state) has the lowest cost.
-This should prefer actions that lead to states where planning
-is easier, even if the immediate cost is slightly higher.
+The key insight: flat CEM picks the action with the best immediate cost.
+Dream Tree picks the action whose predicted future is easiest to plan from.
 
 Usage:
     from harness.pipeline import PlanningPipeline
@@ -54,22 +49,23 @@ class DreamTreePlanner:
     """Tree-structured planner built on pipeline's compiled CEM.
 
     For each planning step:
-    1. Run root CEM → get best action + terminal embedding
-    2. Run root CEM again with different seeds to get K diverse candidates
-    3. For each candidate, run CEM from its terminal state (depth 2 lookahead)
-    4. Pick the root candidate whose depth-2 cost is lowest
+    1. Run K root CEM calls → K diverse (action, terminal_emb) pairs
+    2. For each terminal_emb, run cheap depth scoring (single pass, no CEM)
+    3. Pick the root action whose depth score is lowest
     """
 
     def __init__(
         self,
         pipeline,
-        num_roots: int = 4,
+        num_roots: int = 2,
         max_depth: int = 2,
+        cheap_depth: bool = True,
     ):
         self.pipeline = pipeline
         self.device = pipeline.device
         self.num_roots = num_roots
         self.max_depth = max_depth
+        self.cheap_depth = cheap_depth
         self._action_dim = pipeline._action_dim
 
         self.timing = {"total_ms": [], "root_ms": [], "expansion_ms": []}
@@ -86,7 +82,7 @@ class DreamTreePlanner:
         obs_emb = self.pipeline.encode(obs_tensor)
         goal_emb = self.pipeline.encode(goal_tensor)
 
-        # Phase 1: Generate diverse root candidates
+        # Phase 1: Generate diverse root candidates via full CEM
         t_root = time.perf_counter()
         root_candidates = []
         for _ in range(self.num_roots):
@@ -99,7 +95,7 @@ class DreamTreePlanner:
 
         cem_calls = self.num_roots
 
-        # Phase 2: Expand each root candidate to depth 2+
+        # Phase 2: Score each root candidate's future
         t_expand = time.perf_counter()
 
         best_action = root_candidates[0][0]
@@ -107,23 +103,31 @@ class DreamTreePlanner:
 
         for action, root_cost, terminal_emb in root_candidates:
             if self.max_depth >= 2:
-                # Run CEM from predicted terminal state
-                _, d2_terminal = self.pipeline._cem_plan(
-                    terminal_emb, goal_emb, return_terminal_emb=True
-                )
-                d2_cost = self._cost(d2_terminal, goal_emb)
+                if self.cheap_depth:
+                    # Single-pass random scoring — no CEM iteration
+                    d2_cost = self.pipeline._score_state(terminal_emb, goal_emb)
+                else:
+                    # Full CEM at depth (original, slower)
+                    _, d2_terminal = self.pipeline._cem_plan(
+                        terminal_emb, goal_emb, return_terminal_emb=True
+                    )
+                    d2_cost = self._cost(d2_terminal, goal_emb)
                 cem_calls += 1
 
                 if self.max_depth >= 3:
-                    _, d3_terminal = self.pipeline._cem_plan(
-                        d2_terminal, goal_emb, return_terminal_emb=True
-                    )
-                    d3_cost = self._cost(d3_terminal, goal_emb)
-                    cem_calls += 1
-                    # Value = deepest cost — prefer actions with best futures
-                    value = d3_cost
+                    if self.cheap_depth:
+                        # For depth 3, we need a terminal_emb from depth 2.
+                        # With cheap scoring we don't have one, so use depth-2
+                        # cost as the value (skip depth 3 in cheap mode).
+                        value = d2_cost
+                    else:
+                        _, d3_terminal = self.pipeline._cem_plan(
+                            d2_terminal, goal_emb, return_terminal_emb=True
+                        )
+                        d3_cost = self._cost(d3_terminal, goal_emb)
+                        cem_calls += 1
+                        value = d3_cost
                 else:
-                    # Value = depth-2 cost — prefer actions leading to plannable states
                     value = d2_cost
             else:
                 value = root_cost
@@ -139,7 +143,7 @@ class DreamTreePlanner:
         self.timing["root_ms"].append(t_root)
         self.timing["expansion_ms"].append(t_expand)
         self.stats["total_cem_calls"].append(cem_calls)
-        self.stats["total_nodes"].append(1 + self.num_roots * self.max_depth)
+        self.stats["total_nodes"].append(1 + self.num_roots * min(self.max_depth, 2))
 
         return best_action
 

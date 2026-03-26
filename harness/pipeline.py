@@ -244,6 +244,28 @@ class PlanningPipeline:
 
         return action
 
+    def _score_state(self, obs_emb: torch.Tensor, goal_emb: torch.Tensor) -> float:
+        """Cheaply score how plannable a state is by sampling random actions.
+
+        Runs a single round of random action sampling (no CEM iteration)
+        and returns the min cost. Used by DreamTree for depth scoring
+        without the overhead of full CEM optimization.
+
+        Args:
+            obs_emb: (1, 1, D) state embedding to score
+            goal_emb: (1, 1, D) goal embedding
+
+        Returns:
+            float: min MSE cost across random samples
+        """
+        S = self.num_samples  # 128 — same batch size as compiled path
+        H = 1
+        T = H + self.horizon
+
+        candidates = torch.randn(1, S, T, self._action_dim, device=obs_emb.device)
+        costs, _ = self._evaluate_candidates(obs_emb, goal_emb, candidates, S, H)
+        return float(costs.min())
+
     def _evaluate_candidates(
         self, obs_emb, goal_emb, candidates, S, H, return_embs: bool = False
     ):
