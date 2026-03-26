@@ -1,0 +1,29 @@
+{
+  "mode": "chained",
+  "num_chains": 3,
+  "eval_budget": 100,
+  "num_eval": 50,
+  "success_rate": 4.0,
+  "mean_planning_ms": 302.3737883319457,
+  "effective_hz": 3.307164967957476,
+  "num_successes": 2,
+  "seed": 42,
+  "chainer_timing": {
+    "total_ms": {
+      "mean": 302.35941140888593,
+      "std": 1108.3861047692183,
+      "p50": 266.30043238401413
+    },
+    "chain_ms": {
+      "mean": 289.66874532019483,
+      "std": 1108.2002877295488
+    },
+    "num_chains": 3,
+    "effective_hz": 3.307322220731811,
+    "per_chain_mean_ms": [
+      116.98144355263466,
+      88.09569318325092,
+      84.59160858430924
+    ]
+  }
+}

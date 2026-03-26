@@ -82,7 +82,8 @@ class PlanningPipeline:
         # State
         self._goal_emb = None
         self._compiled = False
-        self._action_dim = 10  # PushT: 2 * action_block(5)
+        # Infer action dim from model's action encoder input channels
+        self._action_dim = self.model.action_encoder.patch_embed.in_channels
 
         # Timing stats
         self.timing = {

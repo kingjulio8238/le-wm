@@ -171,65 +171,75 @@ def run_eval(args):
         if isinstance(goal_pixels, np.ndarray) and goal_pixels.dtype != np.uint8:
             goal_pixels = (goal_pixels * 255).astype(np.uint8) if goal_pixels.max() <= 1.0 else goal_pixels.astype(np.uint8)
 
-        # Set environment state
-        try:
-            if "state" in start_row:
-                world.envs.call("_set_state", state=start_row["state"])
-            if "state" in goal_row:
-                world.envs.call("_set_goal_state", goal_state=goal_row["state"])
-        except Exception:
-            pass  # Some env wrappers may not support this
+        # Reset environment, then set state via unwrapped env
+        world.envs.reset()
+        unwrapped_env = world.envs.envs[0].unwrapped
+        if "state" in start_row:
+            unwrapped_env._set_state(state=start_row["state"])
+        if "state" in goal_row:
+            unwrapped_env._set_goal_state(goal_state=goal_row["state"])
 
         # Run episode
         episode_success = False
         obs_image = start_pixels
+        raw_action_dim = process["action"].scale_.shape[0] if "action" in process else 2
+        action_block = pipeline._action_dim // raw_action_dim
 
-        for step in range(args.eval_budget):
+        env_step = 0
+        while env_step < args.eval_budget:
             t0 = time.perf_counter()
 
             if args.mode == "single":
                 # Standard receding-horizon CEM
-                action = pipeline.plan(obs_image, goal_pixels)
+                raw_action = pipeline.plan(obs_image, goal_pixels)
             else:
                 # Dream chaining
-                action = chainer.plan(obs_image, goal_pixels)
+                raw_action = chainer.plan(obs_image, goal_pixels)
 
             planning_times.append((time.perf_counter() - t0) * 1000)
 
-            # Inverse-transform action if needed
-            if "action" in process:
-                action = process["action"].inverse_transform(action.reshape(1, -1)).squeeze()
+            # Reshape (action_dim,) → (action_block, raw_action_dim) for frameskip
+            sub_actions = raw_action.reshape(action_block, raw_action_dim)
 
-            # Step environment
-            try:
-                obs_dict, reward, terminated, truncated, info = world.envs.step(
-                    np.array([action])
-                )
-                # Get next observation image
-                if hasattr(obs_dict, "get") and "pixels" in obs_dict:
-                    obs_image = obs_dict["pixels"][0]
-                elif isinstance(obs_dict, dict) and "pixels" in obs_dict:
-                    obs_image = obs_dict["pixels"][0]
-                else:
-                    # Render from environment
-                    obs_image = world.envs.call("render")[0]
-
-                if isinstance(terminated, (list, np.ndarray)):
-                    terminated = bool(terminated[0])
-                if isinstance(info, (list, tuple)):
-                    step_info = info[0] if info else {}
-                elif isinstance(info, dict):
-                    step_info = info
-                else:
-                    step_info = {}
-
-                # PushT: terminated=True means goal reached (from eval_state).
-                # Other envs may use info["is_success"] instead.
-                if terminated or step_info.get("is_success", False):
-                    episode_success = True
+            # Execute each sub-action
+            for sub_action in sub_actions:
+                if env_step >= args.eval_budget:
                     break
-            except Exception as e:
-                print(f"  Episode {ep_i} step {step}: env error: {e}")
+
+                # Inverse-transform action if needed
+                if "action" in process:
+                    sub_action = process["action"].inverse_transform(
+                        sub_action.reshape(1, -1)
+                    ).squeeze()
+
+                # Step environment
+                try:
+                    obs_dict, reward, terminated, truncated, info = world.envs.step(
+                        np.array([sub_action])
+                    )
+                    env_step += 1
+                    # Get next observation image via render
+                    obs_image = world.envs.render()[0]
+
+                    if isinstance(terminated, (list, np.ndarray)):
+                        terminated = bool(terminated[0])
+                    if isinstance(info, (list, tuple)):
+                        step_info = info[0] if info else {}
+                    elif isinstance(info, dict):
+                        step_info = info
+                    else:
+                        step_info = {}
+
+                    # PushT: terminated=True means goal reached (from eval_state).
+                    # Other envs may use info["is_success"] instead.
+                    if terminated or step_info.get("is_success", False):
+                        episode_success = True
+                        break
+                except Exception as e:
+                    print(f"  Episode {ep_i} step {env_step}: env error: {e}")
+                    break
+
+            if episode_success:
                 break
 
         successes.append(episode_success)

@@ -1,0 +1,11 @@
+{
+  "mode": "single",
+  "num_chains": 1,
+  "eval_budget": 100,
+  "num_eval": 50,
+  "success_rate": 28.000000000000004,
+  "mean_planning_ms": 93.05474600959116,
+  "effective_hz": 10.746362145751599,
+  "num_successes": 14,
+  "seed": 42
+}
