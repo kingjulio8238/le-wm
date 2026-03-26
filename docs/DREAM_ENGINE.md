@@ -36,11 +36,11 @@ This budget enables tree search that large models cannot do. The small model's s
 
 ---
 
-## Phase D1: Multi-Task Validation
+## Phase D1: Multi-Task Validation (NON-BLOCKING)
 
-**Goal:** Prove the LeHarness pipeline generalizes before adding complexity.
+**Goal:** Prove the LeHarness pipeline generalizes across tasks.
 
-**Why first:** If the pipeline breaks on TwoRoom or Cube, every subsequent phase inherits that fragility. Validation is cheap — the checkpoints and datasets already exist.
+**Status:** Deferred — Google Drive permissions needed for TwoRoom/Cube/Reacher checkpoints. PushT baseline confirmed at 96% success. D2-D5 do not depend on D1. Do this whenever Drive access is sorted.
 
 **Steps:**
 1. Download TwoRoom, Cube, and Reacher datasets + checkpoints from the existing Google Drive.
@@ -50,18 +50,9 @@ This budget enables tree search that large models cannot do. The small model's s
 5. Fix any task-specific issues in the pipeline to make it truly task-agnostic.
 6. Document the per-task results and any tuning needed.
 
-**On-pod commands:**
-```bash
-# Download additional checkpoints and datasets (similar to PushT setup)
-# Then for each task:
-python scripts/final_benchmark.py --config-name=tworoom --policy tworoom/lejepa
-python scripts/final_benchmark.py --config-name=cube --policy ogb_cube/lejepa
-python scripts/final_benchmark.py --config-name=reacher --policy dmc/reacher/lejepa
-```
+**Gate:** Pipeline achieves >50% success on at least 3 of 4 tasks without task-specific code changes.
 
-**Gate:** Pipeline achieves >50% success on at least 3 of 4 tasks without task-specific code changes. If it needs per-task tuning (different CEM budgets), that's fine — document it. If it needs per-task code changes, the abstraction is wrong.
-
-**Estimated cost:** ~$2-4 (one pod session, 3-5 hours).
+**Estimated cost:** ~$2-4 (one pod session).
 
 ---
 
@@ -300,17 +291,27 @@ action = pipeline.plan(obs_image, goal_text="push the T to the target")
 | Write eval script for text vs image goal comparison | Evaluate text-conditioned planning |
 | | Compare success rates: text vs image goals |
 
+### Dependency Chain
+
+```
+D2: Dream Chaining     ← needs working pipeline (have it, 96% on PushT)
+D3: Dream Trees         ← needs D2 (chaining is how trees go deep)
+D4: Dream Scoring v2    ← needs D3 (scoring matters most inside trees)
+D5: Language Conditioning ← independent, can be done anytime
+D1: Multi-Task          ← independent, do when Drive access works
+```
+
+D1 is non-blocking. D5 is independent. The critical path is D2 → D3 → D4.
+
 ### Pod Sessions (Batched)
 
-Phases should be grouped into pod sessions to minimize idle GPU time. Write all code locally between sessions.
-
-| Session | Phases | What to write locally first | Pod work |
-|---------|--------|-----------------------------|----------|
-| **D-Session 1** | D1 | Nothing | Download data, run benchmarks on 4 tasks |
-| **D-Session 2** | D2 | `DreamChainer`, subgoal interpolation, eval script | Run chained eval, measure drift |
-| **D-Session 3** | D3 | `DreamTree` (all logic), tree logging, benchmark script | Profile and benchmark trees vs flat CEM |
-| **D-Session 4** | D4 | Scorer architecture, training script, all penalty implementations | Collect data, train, evaluate |
-| **D-Session 5** | D5 | CLIP integration, projection layer, text eval script | Train projection, evaluate |
+| Session | Phase | What to write locally first | Pod work |
+|---------|-------|-----------------------------|----------|
+| **D-Session 1** | D2 | `DreamChainer`, subgoal interpolation, eval script | Run chained vs single-horizon eval on PushT |
+| **D-Session 2** | D3 | `DreamTree` (all logic), tree logging, benchmark script | Profile and benchmark trees vs flat CEM |
+| **D-Session 3** | D4 | Scorer architecture, training script, all penalty implementations | Collect data, train, evaluate |
+| **D-Session 4** | D5 | CLIP integration, projection layer, text eval script | Train projection, evaluate |
+| **D-Session 5** | D1 | Nothing (needs Drive access) | Download data, run benchmarks on 4 tasks |
 
 **Between sessions:** Review results from the previous session. Decide whether the gate passed. Write all code for the next session. Push to git. Only spin up the pod when code is ready to run.
 
@@ -325,21 +326,112 @@ Phases should be grouped into pod sessions to minimize idle GPU time. Write all 
 ```bash
 bash /workspace/data/setup.sh
 cd /workspace/le-harness
-# For D1, also download additional task data:
-# gdown <tworoom_id> -O /tmp/tworoom.h5.zst && zstd -d ... etc.
+python scripts/patch_icem.py  # apply iCEM fix if not already applied
 ```
+
+### D-Session 1 (D2: Dream Chaining) — On-Pod Instructions
+
+This is the current next session. Code should be written locally and pushed before SSHing in.
+
+**What should already be pushed to git before this session:**
+- `harness/dream_chainer.py` — DreamChainer class
+- `scripts/eval_dream_chaining.py` — Eval script comparing chained vs single-horizon
+- Any modifications to `harness/pipeline.py` to support chaining
+
+**On-pod (copy-paste):**
+
+```bash
+# 1. Setup
+bash /workspace/data/setup.sh
+cd /workspace/le-harness
+python scripts/patch_icem.py
+export STABLEWM_HOME=/workspace/data
+
+# 2. Start tmux
+tmux new -s d2
+
+# 3. Sanity check — confirm PushT baseline still works
+python scripts/final_benchmark.py --policy pusht/lejepa 2>&1 | tail -5
+
+# 4. Run dream chaining eval — single-horizon baseline (horizon 5, receding)
+python scripts/eval_dream_chaining.py \
+  --policy pusht/lejepa \
+  --mode single \
+  --eval-budget 100 \
+  --num-eval 50 \
+  2>&1 | tee /workspace/data/results/d2_single_horizon.log
+
+# 5. Run dream chaining — 3 chains of horizon 5 with subgoal interpolation
+python scripts/eval_dream_chaining.py \
+  --policy pusht/lejepa \
+  --mode chained \
+  --num-chains 3 \
+  --eval-budget 100 \
+  --num-eval 50 \
+  2>&1 | tee /workspace/data/results/d2_chained_3x5.log
+
+# 6. Run dream chaining — 5 chains (horizon 25)
+python scripts/eval_dream_chaining.py \
+  --policy pusht/lejepa \
+  --mode chained \
+  --num-chains 5 \
+  --eval-budget 200 \
+  --num-eval 50 \
+  2>&1 | tee /workspace/data/results/d2_chained_5x5.log
+
+# 7. Measure drift — how much do predicted endpoints diverge from re-encoded reality?
+python scripts/eval_dream_chaining.py \
+  --policy pusht/lejepa \
+  --mode chained \
+  --num-chains 5 \
+  --measure-drift \
+  --num-eval 20 \
+  2>&1 | tee /workspace/data/results/d2_drift.log
+
+# 8. Review results
+echo ""
+echo "========================================="
+echo "  D2: Dream Chaining Results"
+echo "========================================="
+echo ""
+echo "--- Single horizon (baseline) ---"
+tail -10 /workspace/data/results/d2_single_horizon.log
+echo ""
+echo "--- Chained 3x5 ---"
+tail -10 /workspace/data/results/d2_chained_3x5.log
+echo ""
+echo "--- Chained 5x5 ---"
+tail -10 /workspace/data/results/d2_chained_5x5.log
+echo ""
+echo "--- Drift measurement ---"
+tail -10 /workspace/data/results/d2_drift.log
+echo ""
+echo "========================================="
+echo "  GATE: Chained > single on tasks needing >10 steps?"
+echo "========================================="
+
+# 9. Save and stop
+git add -A && git commit -m "D2: dream chaining results" && git push
+# Stop pod from dashboard
+```
+
+**Detach tmux:** `Ctrl+B, D`. Reconnect: `tmux attach -t d2`.
+
+**After stopping pod (off-pod):** Review the 4 log files. If chaining helps, start writing `DreamTree` locally for D-Session 2. If chaining doesn't help (single-horizon is just as good at extended budgets), the task may be too simple — consider whether to proceed to D3 or first find a harder task.
 
 ---
 
 ## Summary: Dream Engine Phases
 
 ```
-D1: Multi-Task Validation   ← prove generality, cheapest phase
-D2: Dream Chaining           ← long-horizon via chained short dreams
+D2: Dream Chaining           ← NEXT — long-horizon via chained short dreams
 D3: Dream Trees              ← structured search, core differentiator
 D4: Dream Scoring v2         ← robust multi-signal scoring, fix reward hacking
-D5: Language Conditioning     ← text goals, table stakes for adoption
+D5: Language Conditioning     ← independent, text goals for adoption
+D1: Multi-Task Validation    ← non-blocking, do when Drive access works
 ```
+
+**Critical path:** D2 → D3 → D4. D1 and D5 are independent.
 
 **Total estimated cost:** ~$15-30 across 5 pod sessions on RunPod RTX 4090.
 
