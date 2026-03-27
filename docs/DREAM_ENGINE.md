@@ -676,13 +676,35 @@ Flat CEM would run at ~2-4 Hz on Orin. Dream Tree would need batched CEM (N1) fi
 
 ---
 
+## Integration Validation: N1 + N2 + D3 Combined — COMPLETE
+
+All combinations of goal mode (image/coord/CLIP) and planner (flat CEM/batched tree) tested on the same 50 TwoRoom episodes:
+
+| Config | Success | Latency | Hz | vs Baseline |
+|--------|---------|---------|-----|-------------|
+| image + flat CEM | 56% | 207ms | 4.8 | baseline |
+| image + batched tree | 50% | 298ms | 3.4 | 89% |
+| coord text + flat CEM | 48% | 204ms | 4.9 | 86% |
+| coord text + batched tree | 42% | 276ms | 3.6 | 75% |
+| CLIP text + flat CEM | 42% | 194ms | 5.2 | 75% |
+| **CLIP text + batched tree** | **48%** | **276ms** | **3.6** | **86%** |
+
+**Key findings:**
+1. The full stack (CLIP text → batched Dream Tree) runs at **3.6 Hz / 276ms** with 86% of image baseline performance.
+2. All tree configs land under 300ms. All flat configs run at ~200ms / 5 Hz.
+3. At n=50 the variance is ~±10%, so all configs (42-56%) are within noise of each other.
+4. The system is ready for LLM orchestration: text command in → fast tree search → action out.
+
+---
+
 ## Next Steps Priority
 
 ```
 N1: Batched CEM        ← DONE (282ms, 3.5 Hz)
 N2: Language (D5)       ← DONE (104% of image, both CLIP and coord paths)
+Integration            ← DONE (text + batched tree at 276ms, 3.6 Hz)
 N3: More Tasks          ← blocked on dataset access
 N4: Jetson              ← blocked on hardware
 ```
 
-**Recommended order:** N3 (more tasks) when datasets become available, or N4 (Jetson) when hardware is procured. Both N1 and N2 are complete.
+**Recommended order:** N3 (more tasks) when datasets become available, or N4 (Jetson) when hardware is procured. N1, N2, and integration are complete.
