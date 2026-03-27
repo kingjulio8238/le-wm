@@ -1,0 +1,20 @@
+{
+  "image": {
+    "success_rate": 46.0,
+    "num_successes": 23,
+    "num_eval": 50,
+    "mean_planning_ms": 209.3574530904142
+  },
+  "coord": {
+    "success_rate": 48.0,
+    "num_successes": 24,
+    "num_eval": 50,
+    "mean_planning_ms": 202.03403800833917
+  },
+  "clip": {
+    "success_rate": 48.0,
+    "num_successes": 24,
+    "num_eval": 50,
+    "mean_planning_ms": 218.50877661790167
+  }
+}

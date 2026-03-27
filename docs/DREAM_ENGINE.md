@@ -543,54 +543,57 @@ Four things separate the current Dream Engine from something engineers would dep
 
 ---
 
-### N2: Language Conditioning (D5)
+### N2: Language Conditioning (D5) — COMPLETE
 
-**Problem:** LeHarness only accepts goal images. Engineers want to say "push the block to the target" or "navigate to the green room."
+**Problem:** LeHarness only accepts goal images. Engineers want to say "push the block to the target" or "navigate to the upper left area."
 
-**Fix:** Frozen CLIP text encoder → small projection layer (512→192) → LeWM's goal embedding space. Everything downstream (CEM, tree, scoring) is unchanged.
+**Fix:** Two-path language encoder: (1) CLIP text encoder → MLP → 192-dim, (2) coordinate parser → MLP → 192-dim. Both paths produce goal embeddings compatible with the existing CEM/tree planning stack.
 
 **Architecture:**
 
 ```
-"navigate to the green room"
+Path 1 (CLIP — qualitative commands):
+  "go to the upper left area"
          ↓
-  CLIP Text Encoder (frozen, ~150M params, runs once per instruction)
+  CLIP ViT-B/32 (frozen) → (512-dim)
          ↓
-  text_embedding (512-dim)
+  MLP (512→512→256→192) — trained on 8K pairs
          ↓
-  Learned linear projection (512 → 192, ~98K params)
+  goal_embedding (192-dim) — cos_sim=0.44 vs image embeddings
+
+Path 2 (Coordinate — precise goals):
+  "navigate to (0.43, 0.57)"
          ↓
-  goal_embedding (192-dim) ← same space as LeWM image goals
+  Parse (x, y) → (2-dim)
          ↓
-  Dream Engine plans toward goal_embedding (unchanged)
+  MLP (2→256→256→192) — trained on 8K pairs
+         ↓
+  goal_embedding (192-dim) — cos_sim=0.63 vs image embeddings
 ```
 
-**Steps:**
-1. **Collect (goal_image, goal_text) pairs**: For TwoRoom, generate synthetic text descriptions from goal states: "navigate to position (X, Y)" or "reach the target in the green room." These can be generated programmatically from the dataset's state columns — no manual annotation needed. For PushT (if dataset is re-downloaded): "push the T-block to position (X, Y) at angle θ."
-2. **Encode both modalities**: Run CLIP text encoder on goal_text, run LeWM encoder on goal_image. Collect ~5,000-10,000 pairs.
-3. **Train projection**: Linear layer (512→192), MSE loss between `projection(CLIP_text(goal_text))` and `LeWM_encoder(goal_image)`. This is a <1 minute training job.
-4. **Integrate into pipeline**: Add `plan_from_text(obs_image, goal_text)` method to `PlanningPipeline` that encodes the text via CLIP → projection, then runs the normal planning loop.
-5. **Evaluate**: Compare success rates with image goal vs text goal on the same episodes. Text path will be lossier but should be within 80% of image-conditioned performance.
+**Key findings:**
+1. **Linear projection fails.** CLIP encodes "navigate to (0.43, 0.57)" and "navigate to (0.80, 0.12)" with cosine sim ~0.75. CLIP doesn't differentiate spatial coordinates — all coordinate-based captions look nearly identical to it.
+2. **Semantic captions + MLP work.** Qualitative descriptions ("go to the upper left area", "head northeast") give CLIP enough discriminative signal. MLP adds the nonlinear capacity a linear layer lacks.
+3. **Data alignment matters.** Initial training used mid-episode frames where the agent was ~78px from the target. These images don't show the target location. Switching to terminal frames (agent at target, dist ~14px) fixed everything.
+4. **Both text paths match image performance.** Despite lower embedding cosine similarity, CEM planning is robust enough that approximate goal embeddings work just as well.
 
-**Blocker:** Need a dataset with both images and text. TwoRoom doesn't have natural language annotations, but synthetic ones ("navigate to (X, Y)") are trivially generated from state data. This is sufficient for proving the mechanism works, even if the language is template-based.
+**Results (TwoRoom, 50 episodes):**
 
-**Off-pod work:**
-- Implement `harness/language_encoder.py`: CLIP loading, projection layer, text→goal_emb pipeline
-- Write synthetic text generation script for TwoRoom (template-based from state data)
-- Write `scripts/train_language_projection.py`
-- Write `scripts/eval_language.py` comparing image vs text goals
-- Push to git
+| Goal Mode | Success Rate | vs Image |
+|-----------|-------------|----------|
+| Image (baseline) | 46% (23/50) | 100% |
+| **Coord text** | **48% (24/50)** | **104%** |
+| **CLIP text** | **48% (24/50)** | **104%** |
 
-**On-pod work:**
-- `pip install transformers` (for CLIP)
-- Generate (goal_image, goal_text) pairs from TwoRoom dataset
-- Train projection layer (~1 min)
-- Evaluate text-conditioned planning vs image-conditioned
-- Run Dream Tree with text goals to verify full stack works
+**Implementation:**
+- `harness/language_encoder.py`: `LanguageEncoder` with `mode="clip"`, `mode="coord"`, or `mode="both"` (try coord first, fall back to CLIP)
+- `pipeline.load_language_encoder(path, mode)` + `pipeline.plan_from_text(obs, text)`
+- Training: `scripts/generate_text_pairs_v3.py` + `scripts/train_language_projection.py`
+- Eval: `scripts/eval_language.py`
 
-**Gate:** Text-conditioned planning achieves ≥80% of image-conditioned success rate on TwoRoom.
+**Gate:** PASS — both text modes achieve ≥80% of image-conditioned success (104%).
 
-**Estimated cost:** ~$2-4 (one pod session).
+**Actual cost:** ~$2 (one pod session).
 
 ---
 
@@ -677,9 +680,9 @@ Flat CEM would run at ~2-4 Hz on Orin. Dream Tree would need batched CEM (N1) fi
 
 ```
 N1: Batched CEM        ← DONE (282ms, 3.5 Hz)
-N2: Language (D5)       ← highest impact, unblocked (synthetic text from TwoRoom state data)
+N2: Language (D5)       ← DONE (104% of image, both CLIP and coord paths)
 N3: More Tasks          ← blocked on dataset access
 N4: Jetson              ← blocked on hardware
 ```
 
-**Recommended order:** N2 next (makes the system usable with language commands). N3 and N4 are nice-to-have when blockers clear.
+**Recommended order:** N3 (more tasks) when datasets become available, or N4 (Jetson) when hardware is procured. Both N1 and N2 are complete.

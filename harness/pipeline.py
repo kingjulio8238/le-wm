@@ -86,6 +86,7 @@ class PlanningPipeline:
         self._obs_emb = None  # cached for scorer's progress signal
         self._compiled = False
         self.scorer = None  # optional DreamScorer for multi-signal cost
+        self.language_encoder = None  # lazy-loaded by set_goal_text()
         # Infer action dim from model's action encoder input channels
         self._action_dim = self.model.action_encoder.patch_embed.in_channels
 
@@ -139,6 +140,39 @@ class PlanningPipeline:
         """Set and cache the goal embedding."""
         goal_tensor = self.preprocess(goal_image_np)
         self._goal_emb = self.encode(goal_tensor)
+
+    def load_language_encoder(self, projection_path: str, mode: str = "coord"):
+        """Load the language encoder with a trained projection.
+
+        Args:
+            projection_path: path to projection weights
+            mode: "coord" (parse coordinates from text), "clip" (CLIP encoder),
+                  or "both" (try coord parsing first, fall back to CLIP)
+        """
+        from harness.language_encoder import LanguageEncoder
+        self.language_encoder = LanguageEncoder(
+            mode=mode, projection_path=projection_path, device=self.device
+        )
+
+    def set_goal_text(self, goal_text: str):
+        """Set goal from natural language description.
+
+        Requires load_language_encoder() to have been called first.
+
+        Args:
+            goal_text: e.g. "navigate to (0.43, 0.57)"
+        """
+        assert self.language_encoder is not None, (
+            "Call load_language_encoder(projection_path) first"
+        )
+        self._goal_emb = self.language_encoder.encode_text(goal_text)
+
+    def plan_from_text(
+        self, obs_image_np: np.ndarray, goal_text: str, record_timing: bool = True
+    ) -> np.ndarray:
+        """Plan from observation image + text goal (convenience wrapper)."""
+        self.set_goal_text(goal_text)
+        return self.plan(obs_image_np, record_timing=record_timing)
 
     @torch.inference_mode()
     def plan(self, obs_image_np: np.ndarray, goal_image_np: np.ndarray = None,
