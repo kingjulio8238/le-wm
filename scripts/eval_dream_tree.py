@@ -40,11 +40,11 @@ from harness.pipeline import PlanningPipeline
 from harness.dream_tree import DreamTreePlanner
 
 
-def load_eval_config():
+def load_eval_config(config_name="pusht"):
     from hydra import compose, initialize_config_dir
     config_dir = str(Path("./config/eval").resolve())
     with initialize_config_dir(version_base=None, config_dir=config_dir):
-        cfg = compose(config_name="pusht")
+        cfg = compose(config_name=config_name)
     return cfg
 
 
@@ -107,7 +107,7 @@ def setup_eval_env(cfg, args):
 
 
 def run_episodes(planner_fn, dataset, process, world, episode_idx, col_name,
-                 eval_episodes, eval_start_steps, goal_offset, args):
+                 eval_episodes, eval_start_steps, goal_offset, args, cfg=None):
     """Run evaluation episodes with a given planner function.
 
     Args:
@@ -153,10 +153,29 @@ def run_episodes(planner_fn, dataset, process, world, episode_idx, col_name,
         # Reset environment
         world.envs.reset()
         unwrapped_env = world.envs.envs[0].unwrapped
-        if "state" in start_row:
-            unwrapped_env._set_state(state=start_row["state"])
-        if "state" in goal_row:
-            unwrapped_env._set_goal_state(goal_state=goal_row["state"])
+
+        # Apply callables from config (handles both PushT "state" and TwoRoom "proprio")
+        callables = OmegaConf.to_container(cfg.eval.get("callables"), resolve=True) if cfg.eval.get("callables") else []
+        for spec in callables:
+            method_name = spec["method"]
+            if not hasattr(unwrapped_env, method_name):
+                continue
+            method = getattr(unwrapped_env, method_name)
+            prepared_args = {}
+            for arg_name, arg_data in spec.get("args", {}).items():
+                value_key = arg_data.get("value", None)
+                if value_key is None:
+                    continue
+                # goal_ prefix means look in goal_row, strip prefix for column name
+                if value_key.startswith("goal_"):
+                    col = value_key[5:]  # e.g. "goal_proprio" -> "proprio"
+                    if col in goal_row:
+                        prepared_args[arg_name] = goal_row[col]
+                else:
+                    if value_key in start_row:
+                        prepared_args[arg_name] = start_row[value_key]
+            if prepared_args:
+                method(**prepared_args)
 
         episode_success = False
         obs_image = start_pixels
@@ -225,7 +244,7 @@ def run_eval(args):
     print(f"Num eval: {args.num_eval} episodes")
     print(f"Policy: {args.policy}")
 
-    cfg = load_eval_config()
+    cfg = load_eval_config(args.config_name)
 
     # Build pipeline (shared by both planners)
     print("\nLoading and compiling model...")
@@ -249,7 +268,7 @@ def run_eval(args):
         print(f"\n--- Flat CEM (baseline) ---")
         successes, planning_times = run_episodes(
             pipeline.plan, dataset, process, world, episode_idx, col_name,
-            eval_episodes, eval_start_steps, goal_offset, args,
+            eval_episodes, eval_start_steps, goal_offset, args, cfg=cfg,
         )
         sr = np.mean(successes) * 100
         mean_ms = np.mean(planning_times) if planning_times else 0
@@ -281,7 +300,7 @@ def run_eval(args):
 
         successes, planning_times = run_episodes(
             tree_planner.plan, dataset, process, world, episode_idx, col_name,
-            eval_episodes, eval_start_steps, goal_offset, args,
+            eval_episodes, eval_start_steps, goal_offset, args, cfg=cfg,
         )
         sr = np.mean(successes) * 100
         mean_ms = np.mean(planning_times) if planning_times else 0
@@ -336,6 +355,7 @@ def run_eval(args):
 def main():
     parser = argparse.ArgumentParser(description="D3: Dream Tree Evaluation")
     parser.add_argument("--policy", default="pusht/lejepa")
+    parser.add_argument("--config-name", default="pusht", help="Eval config name (e.g. pusht, tworoom)")
     parser.add_argument("--mode", choices=["flat", "tree", "both"], default="both")
     parser.add_argument("--eval-budget", type=int, default=50)
     parser.add_argument("--num-eval", type=int, default=50)
