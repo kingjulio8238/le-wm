@@ -49,6 +49,7 @@ class PlanningPipeline:
         history_size: int = 3,
         topk: int = 25,
         device: str = "cuda",
+        compile_mode: str = "reduce-overhead",
     ):
         self.num_samples = num_samples
         self.n_steps = n_steps
@@ -56,6 +57,7 @@ class PlanningPipeline:
         self.history_size = history_size
         self.topk = topk
         self.device = device
+        self.compile_mode = compile_mode
 
         # Load model
         self.model = swm.policy.AutoCostModel(policy_name)
@@ -68,7 +70,7 @@ class PlanningPipeline:
             self.model,
             compile_predictor=True,
             compile_encoder=True,
-            mode="reduce-overhead",
+            mode=compile_mode,
         )
 
         # Image preprocessing (same as eval.py)
@@ -292,16 +294,89 @@ class PlanningPipeline:
 
         return best_cost
 
+    def _cem_plan_batched(self, obs_emb: torch.Tensor, goal_emb: torch.Tensor,
+                          return_terminal_emb: bool = True):
+        """Run B independent CEM instances in parallel.
+
+        Args:
+            obs_emb: (B, 1, D) — B different starting states
+            goal_emb: (B, 1, D) — B corresponding goals (can be same goal broadcast)
+
+        Returns:
+            actions: (B, action_dim) numpy array — best action from each CEM
+            terminal_embs: (B, 1, D) tensor — predicted endpoint of each best plan
+        """
+        B = obs_emb.shape[0]
+        S = self.num_samples
+        H = 1
+        T = H + self.horizon
+        D = obs_emb.shape[-1]
+        device = obs_emb.device
+
+        # Initialize B independent CEM distributions
+        mean = torch.zeros(B, T, self._action_dim, device=device)
+        var = torch.ones(B, T, self._action_dim, device=device)
+
+        for cem_iter in range(self.n_steps):
+            # Sample candidates: (B, S, T, action_dim)
+            noise = torch.randn(B, S, T, self._action_dim, device=device)
+            candidates = noise * var.unsqueeze(1) + mean.unsqueeze(1)
+            candidates[:, 0] = mean  # inject mean as first candidate for each batch
+
+            # Evaluate: rollout + cost — (B, S)
+            costs, _ = self._evaluate_candidates(
+                obs_emb, goal_emb, candidates, S, H, return_embs=False
+            )
+
+            # Select top-k per batch element
+            topk_vals, topk_inds = torch.topk(costs, k=self.topk, dim=1, largest=False)
+            # topk_inds: (B, topk) — indices into dim 1 of candidates
+
+            # Gather elite candidates: (B, topk, T, action_dim)
+            topk_inds_expanded = topk_inds.unsqueeze(-1).unsqueeze(-1).expand(
+                B, self.topk, T, self._action_dim
+            )
+            topk_cands = torch.gather(candidates, 1, topk_inds_expanded)
+
+            # Update distribution per batch
+            mean = topk_cands.mean(dim=1)  # (B, T, action_dim)
+            var = topk_cands.std(dim=1)    # (B, T, action_dim)
+
+        # Extract actions: first timestep of each mean plan
+        actions = mean[:, 0].cpu().numpy()  # (B, action_dim)
+
+        if return_terminal_emb:
+            # Re-evaluate each mean trajectory to get terminal embeddings
+            mean_candidates = mean.unsqueeze(1)  # (B, 1, T, action_dim)
+            _, mean_embs = self._evaluate_candidates(
+                obs_emb, goal_emb, mean_candidates, 1, H, return_embs=True
+            )
+            # mean_embs: (B, 1, T_rollout, D)
+            terminal_embs = mean_embs[:, 0, -1:, :]  # (B, 1, D)
+            return actions, terminal_embs
+
+        return actions, None
+
     def _evaluate_candidates(
         self, obs_emb, goal_emb, candidates, S, H, return_embs: bool = False
     ):
         """Evaluate candidate action sequences via rollout + MSE cost.
 
+        Supports arbitrary batch size B (for batched CEM).
+
+        Args:
+            obs_emb: (B, 1, D) observation embeddings
+            goal_emb: (B, 1, D) goal embeddings
+            candidates: (B, S, T, action_dim)
+            S: number of samples per batch element
+            H: history length
+            return_embs: if True, return predicted embeddings
+
         Returns:
             costs: (B, S) tensor of MSE costs
             If return_embs: (costs, all_embs) where all_embs is (B, S, T, D)
         """
-        B = 1
+        B = obs_emb.shape[0]
         horizon = self.horizon
 
         # Expand obs for all samples
@@ -331,7 +406,8 @@ class PlanningPipeline:
         emb = torch.cat([emb, pred], dim=1)
 
         # Cost computation
-        pred_emb = rearrange(emb, "(b s) t d -> b s t d", b=B, s=S)
+        pred_emb = rearrange(emb, "(b_s) t d -> b_s t d", b_s=B * S)
+        pred_emb = pred_emb.view(B, S, pred_emb.shape[1], pred_emb.shape[2])
 
         if self.scorer is not None and self._obs_emb is not None:
             # Multi-signal scoring (D4)

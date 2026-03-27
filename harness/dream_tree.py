@@ -50,8 +50,11 @@ class DreamTreePlanner:
 
     For each planning step:
     1. Run K root CEM calls → K diverse (action, terminal_emb) pairs
-    2. For each terminal_emb, run cheap depth scoring (single pass, no CEM)
-    3. Pick the root action whose depth score is lowest
+    2. For each terminal_emb, run depth scoring via CEM
+    3. Pick the root action whose depth-2 future cost is lowest
+
+    Supports both sequential mode (CUDA-graph compatible, B=1 per call)
+    and batched mode (B=K per call, faster but requires flexible compile).
     """
 
     def __init__(
@@ -60,12 +63,14 @@ class DreamTreePlanner:
         num_roots: int = 4,
         max_depth: int = 2,
         cheap_depth: bool = True,
+        batched: bool = False,
     ):
         self.pipeline = pipeline
         self.device = pipeline.device
         self.num_roots = num_roots
         self.max_depth = max_depth
         self.cheap_depth = cheap_depth
+        self.batched = batched
         self._action_dim = pipeline._action_dim
 
         # Cache uncompiled predictor for flexible depth scoring
@@ -86,9 +91,83 @@ class DreamTreePlanner:
         # Encode
         obs_tensor = self.pipeline.preprocess(obs_image_np)
         goal_tensor = self.pipeline.preprocess(goal_image_np)
-        obs_emb = self.pipeline.encode(obs_tensor)
-        goal_emb = self.pipeline.encode(goal_tensor)
+        obs_emb = self.pipeline.encode(obs_tensor)   # (1, 1, D)
+        goal_emb = self.pipeline.encode(goal_tensor)  # (1, 1, D)
 
+        if self.batched:
+            action = self._plan_batched(obs_emb, goal_emb)
+        else:
+            action = self._plan_sequential(obs_emb, goal_emb)
+
+        t_total = (time.perf_counter() - t_start) * 1000
+        self.timing["total_ms"].append(t_total)
+
+        return action
+
+    def _plan_batched(self, obs_emb, goal_emb):
+        """Batched tree: root and depth CEM calls run as batched GPU ops."""
+        K = self.num_roots
+
+        # Phase 1: Batched root CEM — K parallel CEM instances
+        t_root = time.perf_counter()
+        batched_obs = obs_emb.expand(K, -1, -1)    # (K, 1, D)
+        batched_goal = goal_emb.expand(K, -1, -1)  # (K, 1, D)
+
+        root_actions, root_terminal_embs = self.pipeline._cem_plan_batched(
+            batched_obs, batched_goal, return_terminal_emb=True
+        )
+        # root_actions: (K, action_dim) numpy
+        # root_terminal_embs: (K, 1, D) tensor
+        t_root = (time.perf_counter() - t_root) * 1000
+        self.timing["root_ms"].append(t_root)
+
+        cem_calls = 1  # one batched call
+
+        # Phase 2: Batched depth scoring
+        t_expand = time.perf_counter()
+
+        if self.max_depth >= 2:
+            if self.cheap_depth:
+                # Score each root's future with mini-CEM (still batched)
+                depth_costs = []
+                for i in range(K):
+                    c = self.pipeline._score_state(
+                        root_terminal_embs[i:i+1], goal_emb, n_rounds=3
+                    )
+                    depth_costs.append(c)
+                cem_calls += K
+            else:
+                # Full batched CEM at depth
+                depth_goal = goal_emb.expand(K, -1, -1)  # (K, 1, D)
+                _, depth_terminal_embs = self.pipeline._cem_plan_batched(
+                    root_terminal_embs, depth_goal, return_terminal_emb=True
+                )
+                # Score: MSE between depth terminal and goal
+                depth_costs = [
+                    self._cost(depth_terminal_embs[i:i+1], goal_emb)
+                    for i in range(K)
+                ]
+                cem_calls += 1  # one batched call
+        else:
+            depth_costs = [
+                self._cost(root_terminal_embs[i:i+1], goal_emb)
+                for i in range(K)
+            ]
+
+        t_expand = (time.perf_counter() - t_expand) * 1000
+        self.timing["expansion_ms"].append(t_expand)
+
+        # Select best root
+        best_idx = int(np.argmin(depth_costs))
+        best_action = root_actions[best_idx]
+
+        self.stats["total_cem_calls"].append(cem_calls)
+        self.stats["total_nodes"].append(1 + K * min(self.max_depth, 2))
+
+        return best_action
+
+    def _plan_sequential(self, obs_emb, goal_emb):
+        """Sequential tree: original implementation with one CEM call at a time."""
         # Phase 1: Generate diverse root candidates via full CEM
         t_root = time.perf_counter()
         root_candidates = []
@@ -99,6 +178,7 @@ class DreamTreePlanner:
             cost = self._cost(terminal_emb, goal_emb)
             root_candidates.append((action, cost, terminal_emb))
         t_root = (time.perf_counter() - t_root) * 1000
+        self.timing["root_ms"].append(t_root)
 
         cem_calls = self.num_roots
 
@@ -108,17 +188,11 @@ class DreamTreePlanner:
         best_action = root_candidates[0][0]
         best_value = float("inf")
 
-        # Cheap depth uses _score_state (S=128, same shape as compiled path).
-        # Full depth uses _cem_plan which needs return_terminal_emb (already compiled).
-        # No predictor swap needed for either path.
-
         for action, root_cost, terminal_emb in root_candidates:
             if self.max_depth >= 2:
                 if self.cheap_depth:
-                    # Mini-CEM scoring: 3 rounds of 128 samples (vs 15 for full CEM)
                     d2_cost = self.pipeline._score_state(terminal_emb, goal_emb, n_rounds=3)
                 else:
-                    # Full CEM at depth (compiled, slower)
                     _, d2_terminal = self.pipeline._cem_plan(
                         terminal_emb, goal_emb, return_terminal_emb=True
                     )
@@ -144,13 +218,7 @@ class DreamTreePlanner:
                 best_value = value
                 best_action = action
 
-        # No swap needed — both paths use compiled-compatible shapes
-
         t_expand = (time.perf_counter() - t_expand) * 1000
-        t_total = (time.perf_counter() - t_start) * 1000
-
-        self.timing["total_ms"].append(t_total)
-        self.timing["root_ms"].append(t_root)
         self.timing["expansion_ms"].append(t_expand)
         self.stats["total_cem_calls"].append(cem_calls)
         self.stats["total_nodes"].append(1 + self.num_roots * min(self.max_depth, 2))
