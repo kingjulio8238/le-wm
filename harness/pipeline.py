@@ -150,9 +150,25 @@ class PlanningPipeline:
             return result["emb"]
 
     def set_goal(self, goal_image_np: np.ndarray):
-        """Set and cache the goal embedding."""
+        """Set and cache the goal embedding from an image."""
         goal_tensor = self.preprocess(goal_image_np)
         self._goal_emb = self.encode(goal_tensor)
+
+    def set_goal_embedding(self, emb: torch.Tensor):
+        """Set goal directly from a pre-computed embedding.
+
+        This is the primary integration point for S2 (VLM) systems — the
+        VLM produces an embedding, projects it to 192-dim via GoalAdapter,
+        and injects it here.
+
+        Args:
+            emb: (1, 1, D) or (1, D) or (D,) tensor in LeWM's 192-dim space
+        """
+        if emb.dim() == 1:
+            emb = emb.unsqueeze(0).unsqueeze(0)
+        elif emb.dim() == 2:
+            emb = emb.unsqueeze(1)
+        self._goal_emb = emb.to(self.device).float()
 
     def load_language_encoder(self, projection_path: str, mode: str = "coord"):
         """Load the language encoder with a trained projection.

@@ -27,43 +27,7 @@ import torch
 import torch.nn as nn
 import open_clip
 
-
-class CoordProjection(nn.Module):
-    """MLP mapping (x, y) coordinates to LeWM embedding space."""
-
-    def __init__(self, hidden_dim=256, out_dim=192):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class CLIPProjection(nn.Module):
-    """MLP mapping CLIP text features to LeWM embedding space."""
-
-    def __init__(self, in_dim=512, hidden_dim=512, out_dim=192):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, out_dim),
-        )
-
-    def forward(self, x):
-        return self.net(x)
+from harness.projections import CoordProjection, CLIPProjection
 
 
 def _parse_coordinates(text: str) -> tuple[float, float] | None:
