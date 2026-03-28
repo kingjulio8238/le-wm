@@ -185,7 +185,7 @@ class DreamTreePlanner:
         t_root = time.perf_counter()
         root_candidates = []
         for _ in range(self.num_roots):
-            action, terminal_emb = self.pipeline._cem_plan(
+            action, terminal_emb, _ = self.pipeline._cem_plan(
                 obs_emb, goal_emb, return_terminal_emb=True
             )
             cost = self._cost(terminal_emb, goal_emb)
@@ -206,7 +206,7 @@ class DreamTreePlanner:
                 if self.cheap_depth:
                     d2_cost = self.pipeline._score_state(terminal_emb, goal_emb, n_rounds=3)
                 else:
-                    _, d2_terminal = self.pipeline._cem_plan(
+                    _, d2_terminal, _ = self.pipeline._cem_plan(
                         terminal_emb, goal_emb, return_terminal_emb=True
                     )
                     d2_cost = self._cost(d2_terminal, goal_emb)
@@ -216,7 +216,7 @@ class DreamTreePlanner:
                     if self.cheap_depth:
                         value = d2_cost
                     else:
-                        _, d3_terminal = self.pipeline._cem_plan(
+                        _, d3_terminal, _ = self.pipeline._cem_plan(
                             d2_terminal, goal_emb, return_terminal_emb=True
                         )
                         d3_cost = self._cost(d3_terminal, goal_emb)

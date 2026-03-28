@@ -93,7 +93,7 @@ class DreamChainer:
                 t_chain = time.perf_counter()
 
                 # CEM plans from current_emb toward subgoal[i]
-                action, terminal_emb = self.pipeline._cem_plan(
+                action, terminal_emb, _ = self.pipeline._cem_plan(
                     current_emb, subgoals[i], return_terminal_emb=True
                 )
 
@@ -140,7 +140,7 @@ class DreamChainer:
         chain_actions = []
 
         for i in range(self.num_chains):
-            action, terminal_emb = self.pipeline._cem_plan(
+            action, terminal_emb, _ = self.pipeline._cem_plan(
                 current_emb, subgoals[i], return_terminal_emb=True
             )
             chain_actions.append(action)

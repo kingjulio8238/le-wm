@@ -2,7 +2,7 @@
 Phase 7: End-to-End Planning Pipeline
 
 Clean API wrapping the full LeHarness planning stack:
-  observation image → preprocessing → compiled encoder → CEM planning → action
+  observation image → preprocessing → compiled encoder → CEM planning → PlanResult
 
 Usage:
     from harness.pipeline import PlanningPipeline
@@ -10,13 +10,20 @@ Usage:
     pipeline = PlanningPipeline("pusht/lejepa")
     pipeline.warmup()  # triggers torch.compile (one-time)
 
-    # Plan from raw images
-    action = pipeline.plan(obs_image_np, goal_image_np)
+    # Plan from raw images — returns PlanResult
+    result = pipeline.plan(obs_image_np, goal_image_np)
+    result.action          # (action_dim,) numpy array
+    result.confidence      # 0.0-1.0
+    result.needs_replan    # True if confidence < threshold
+
+    # Backward compatible: PlanResult supports numpy array protocol
+    result.reshape(5, 2)   # works like np.ndarray
+    np.array(result)        # returns the action array
 
     # Or use in eval loop
     pipeline.set_goal(goal_image_np)
     for obs in observations:
-        action = pipeline.plan(obs)
+        result = pipeline.plan(obs)
 """
 
 import time
@@ -31,6 +38,7 @@ from einops import rearrange
 from torchvision.transforms import v2 as transforms
 
 from harness.compiled_inference import optimize_model
+from harness.plan_result import PlanResult
 
 
 class PlanningPipeline:
@@ -50,6 +58,8 @@ class PlanningPipeline:
         topk: int = 25,
         device: str = "cuda",
         compile_mode: str = "reduce-overhead",
+        replan_threshold: float = 0.3,
+        cost_scale: float = 10.0,
     ):
         self.num_samples = num_samples
         self.n_steps = n_steps
@@ -58,6 +68,8 @@ class PlanningPipeline:
         self.topk = topk
         self.device = device
         self.compile_mode = compile_mode
+        self.replan_threshold = replan_threshold
+        self.cost_scale = cost_scale
 
         # Load model
         self.model = swm.policy.AutoCostModel(policy_name)
@@ -95,6 +107,7 @@ class PlanningPipeline:
             "preprocess_ms": [],
             "encode_ms": [],
             "cem_ms": [],
+            "planability_ms": [],
             "total_ms": [],
         }
 
@@ -169,15 +182,19 @@ class PlanningPipeline:
 
     def plan_from_text(
         self, obs_image_np: np.ndarray, goal_text: str, record_timing: bool = True
-    ) -> np.ndarray:
+    ) -> "PlanResult":
         """Plan from observation image + text goal (convenience wrapper)."""
         self.set_goal_text(goal_text)
         return self.plan(obs_image_np, record_timing=record_timing)
 
     @torch.inference_mode()
     def plan(self, obs_image_np: np.ndarray, goal_image_np: np.ndarray = None,
-             record_timing: bool = True) -> np.ndarray:
+             record_timing: bool = True) -> "PlanResult":
         """Plan an action from observation (and optionally goal) images.
+
+        Returns a PlanResult with the action and confidence signals.
+        Backward compatible: supports numpy array protocol, so
+        result.reshape(...) and np.array(result) return the action.
 
         Args:
             obs_image_np: (H, W, 3) uint8 observation image
@@ -185,7 +202,7 @@ class PlanningPipeline:
             record_timing: whether to record per-component timing
 
         Returns:
-            action: (action_dim,) numpy array
+            PlanResult with action, confidence, terminal_embedding, etc.
         """
         t_total_start = time.perf_counter()
 
@@ -204,12 +221,18 @@ class PlanningPipeline:
         torch.cuda.synchronize()
         t_encode = (time.perf_counter() - t0) * 1000
 
-        # CEM planning with cached embeddings
+        # CEM planning with cached embeddings — always get cost + terminal emb
         t0 = time.perf_counter()
-        result = self._cem_plan(obs_emb, self._goal_emb)
-        action = result if isinstance(result, np.ndarray) else result[0]
+        action, terminal_emb, best_cost = self._cem_plan(
+            obs_emb, self._goal_emb, return_terminal_emb=True, return_cost=True
+        )
         torch.cuda.synchronize()
         t_cem = (time.perf_counter() - t0) * 1000
+
+        # Planability: how easy is it to keep planning from the predicted future?
+        t0 = time.perf_counter()
+        planability = self._score_state(terminal_emb, self._goal_emb, n_rounds=1)
+        t_planability = (time.perf_counter() - t0) * 1000
 
         t_total = (time.perf_counter() - t_total_start) * 1000
 
@@ -217,12 +240,24 @@ class PlanningPipeline:
             self.timing["preprocess_ms"].append(t_preprocess)
             self.timing["encode_ms"].append(t_encode)
             self.timing["cem_ms"].append(t_cem)
+            self.timing["planability_ms"].append(t_planability)
             self.timing["total_ms"].append(t_total)
 
-        return action
+        # Normalize confidence: 1.0 = cost is 0, 0.0 = cost >= cost_scale
+        confidence = 1.0 - min(best_cost / self.cost_scale, 1.0)
+
+        return PlanResult(
+            action=action,
+            planning_cost=best_cost,
+            confidence=confidence,
+            terminal_embedding=terminal_emb,
+            planability=planability,
+            planning_ms=t_total,
+            replan_threshold=self.replan_threshold,
+        )
 
     def _cem_plan(self, obs_emb: torch.Tensor, goal_emb: torch.Tensor,
-                  return_terminal_emb: bool = False):
+                  return_terminal_emb: bool = False, return_cost: bool = False):
         """Run CEM optimization with cached embeddings.
 
         Args:
@@ -230,11 +265,12 @@ class PlanningPipeline:
             goal_emb: (1, 1, 192) goal embedding
             return_terminal_emb: if True, also return the predicted terminal
                 embedding of the best trajectory
+            return_cost: if True, also return the best CEM cost
 
         Returns:
             action: (action_dim,) numpy array — first action from best plan
-            If return_terminal_emb:
-                (action, terminal_emb) where terminal_emb is (1, 1, D) tensor
+            If return_terminal_emb or return_cost, returns a tuple:
+                (action, terminal_emb_or_None, best_cost_or_None)
         """
         S = self.num_samples
         H = 1  # history length (from obs)
@@ -247,6 +283,7 @@ class PlanningPipeline:
         var = torch.ones(1, T, self._action_dim, device=device)
 
         last_all_embs = None
+        best_cost = None
 
         for cem_iter in range(self.n_steps):
             # Sample candidates
@@ -263,6 +300,7 @@ class PlanningPipeline:
             # Select top-k
             topk_vals, topk_inds = torch.topk(costs, k=self.topk, dim=1, largest=False)
             topk_cands = candidates[0, topk_inds[0]]  # (topk, T, action_dim)
+            best_cost = float(topk_vals[0, 0])
 
             # Update distribution
             mean = topk_cands.mean(dim=0, keepdim=True)
@@ -270,16 +308,18 @@ class PlanningPipeline:
 
         action = mean[0, 0].cpu().numpy()
 
-        if return_terminal_emb:
-            # Get terminal embedding of the best candidate (index 0 = mean, which was injected)
-            # Re-evaluate the mean trajectory to get its exact terminal embedding
-            mean_candidate = mean.unsqueeze(1)  # (1, 1, T, action_dim)
-            _, mean_embs = self._evaluate_candidates(
-                obs_emb, goal_emb, mean_candidate, 1, H, return_embs=True
-            )
-            terminal_emb = mean_embs[:, :, -1:, :]  # (1, 1, 1, D) → squeeze to (1, 1, D)
-            terminal_emb = terminal_emb.squeeze(1)  # (1, 1, D)
-            return action, terminal_emb
+        if return_terminal_emb or return_cost:
+            terminal_emb = None
+            if return_terminal_emb:
+                # Get terminal embedding of the best candidate (index 0 = mean, which was injected)
+                # Re-evaluate the mean trajectory to get its exact terminal embedding
+                mean_candidate = mean.unsqueeze(1)  # (1, 1, T, action_dim)
+                _, mean_embs = self._evaluate_candidates(
+                    obs_emb, goal_emb, mean_candidate, 1, H, return_embs=True
+                )
+                terminal_emb = mean_embs[:, :, -1:, :]  # (1, 1, 1, D) → squeeze to (1, 1, D)
+                terminal_emb = terminal_emb.squeeze(1)  # (1, 1, D)
+            return action, terminal_emb, best_cost
 
         return action
 

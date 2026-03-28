@@ -181,7 +181,7 @@ def collect_random_rollout_data(pipeline, dataset, cfg, n_pairs: int = 3000, dev
 
             # Run CEM planning — this uses compiled path (S=128)
             # and captures terminal embeddings at different CEM convergence levels
-            action, terminal_emb = pipeline._cem_plan(
+            action, terminal_emb, _ = pipeline._cem_plan(
                 obs_emb, goal_emb, return_terminal_emb=True
             )
 
